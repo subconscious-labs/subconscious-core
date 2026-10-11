@@ -245,12 +245,6 @@ def ensure_system_prompt(
     # L1.5: always per-request - KG and RAG depend on the current question
     last_user = _last_user_text(messages)
     if last_user:
-        extra = memory.kg_recall_from_text(last_user)
-        if extra:
-            layer_sizes["L1.5_kg"] = len(extra)
-            log.debug("[sidecar] injecting %d-char KG recall into system prompt", len(extra))
-            base_prompt = f"{base_prompt}\n\n# Recalled facts\n{extra}"
-
         rag_ctx = rag.retrieve(last_user)
         if rag_ctx:
             layer_sizes["L1.5_rag"] = len(rag_ctx)
@@ -543,23 +537,14 @@ def init_tools():
     global TOOLS, TOOL_REGISTRY, _MCP_CLIENTS
     log.info("[tools] initializing MCP tools...")
     TOOLS, TOOL_REGISTRY, _MCP_CLIENTS = load_tools()
+    import mcp_registry
+    mcp_registry.reset(TOOLS, TOOL_REGISTRY)
     atexit.register(_stop_all_mcp_clients)
     log.info("[tools] total: %d tools in registry", len(TOOLS))
 
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     """Invoke a tool by name."""
-    if name == "mempalace_kg_query":
-        entity = arguments.get("entity", "")
-        if entity:
-            fast = memory.kg_recall(entity)
-            if fast:
-                log.info(
-                    "[tool] mempalace_kg_query intercepted by FastMemory (entity=%s)",
-                    entity,
-                )
-                return {"facts": fast, "source": "fast_memory"}
-
     client = TOOL_REGISTRY.get(name)
     if client is None:
         log.error("[tool] unknown tool requested: %s", name)

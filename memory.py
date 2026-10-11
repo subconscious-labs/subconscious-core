@@ -1,42 +1,34 @@
 #!/usr/bin/env python3
-"""memory.py - fast in-process memory abstraction for chatd.
+"""memory.py — memory abstraction for chatd.
 
 Layered memory model:
-  L0   mempalace : model identity.txt - always loaded
-  L1   mempalace : Essential Story (wake-up context) - always loaded
-  L1.5 chatd     : request-scoped sidecar - KG recall + external RAG
-                   injected per request - always loaded
+  L0   mempalace : identity.txt — always loaded
+  L1   mempalace : Essential Story (wake-up context) — always loaded
+  L1.5 chatd     : request-scoped sidecar — RAG recall (KG recall removed)
+                   injected per request — always loaded
                    (disable with CHATD_LAYER_15_ENABLED=false)
-  L2   mempalace : Room Recall (filtered retrieval) - when topic comes up
-  L3   mempalace : Deep Search (full semantic query) - when explicitly asked
+  L2   mempalace : Room Recall (filtered retrieval) — when topic comes up
+  L3   mempalace : Deep Search (full semantic query) — when explicitly asked
 
-mempalace layers (L0, L1, L2, L3) are never modified here.
-chatd layer (L1.5) is a purely additive overlays.
+mempalace layers (L0, L1, L2, L3) are managed by mempalace itself.
+chatd layer (L1.5) is a purely additive overlay.
 
-Note: per-chat rolling summary (formerly part of L0.5) has been removed.
-Context management is handled by the GUI sending full messages[] and by
-build_model_messages() capping history at 20 user+assistant pairs.
+Note: KG and FastMemory were removed in Stage 2. The wake-up block is now
+assembled from local identity.txt plus a KG snippet fetched over MCP.
 """
 import functools
 import logging
 import os
-from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from mempalace.knowledge_graph import KnowledgeGraph
-
-from config import (
-    MEMPALACE_KG_PATH,
-    MEMPALACE_PALACE_PATH,
-)
+from config import MEMPALACE_PALACE_PATH  # kept for backwards compat / logging
 
 log = logging.getLogger("chatd.memory")
 
 # ── Layer feature flags ───────────────────────────────────────────────────────
 
 def _bool_env(name: str, default: bool = True) -> bool:
-    """Read a boolean environment variable.  Accepts true/false (case-insensitive)."""
     val = os.environ.get(name, "").strip().lower()
     if not val:
         return default
@@ -45,116 +37,8 @@ def _bool_env(name: str, default: bool = True) -> bool:
 
 LAYER_15_ENABLED: bool = _bool_env("CHATD_LAYER_15_ENABLED", default=True)
 
-# ── L1: in-process KG ───────────────────────────────────────────────────────
 
-_kg: Optional[KnowledgeGraph] = None
-
-# Words to skip when extracting entity candidates from free text.
-_STOPWORDS = frozenset({
-    "что", "как", "где", "это", "мне", "ты", "я", "он", "она", "они",
-    "мой", "моя", "моё", "мои", "the", "and", "for", "you", "are",
-    "that", "this", "with", "from", "have", "what", "when", "where",
-})
-
-
-def _get_kg() -> Optional[KnowledgeGraph]:
-    """Return a shared KnowledgeGraph instance, initialised lazily."""
-    global _kg
-    if _kg is None:
-        kg_path = os.path.expanduser(MEMPALACE_KG_PATH)
-        if not Path(kg_path).exists():
-            log.warning("FastMemory: KG database not found: %s", kg_path)
-            return None
-        try:
-            _kg = KnowledgeGraph(db_path=kg_path)
-            log.info("FastMemory: KnowledgeGraph opened at %s", kg_path)
-        except Exception as e:
-            log.warning("FastMemory: KnowledgeGraph init failed: %s", e)
-    return _kg
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def kg_recall(entity: str) -> Optional[str]:
-    """Return all current KG facts for *entity* as a compact text block."""
-    kg = _get_kg()
-    if kg is None:
-        return None
-    try:
-        triples = kg.query_entity(entity, as_of=date.today().isoformat())
-    except Exception as e:
-        log.warning("FastMemory: kg_recall(%s) failed: %s", entity, e)
-        return None
-    if not triples:
-        return None
-    lines = [
-        f"{t['subject']} {t['predicate']} {t['object']}"
-        for t in triples
-        if t.get("current")
-    ]
-    return "\n".join(lines) if lines else None
-
-
-def kg_recall_from_text(text: str, max_results: int = 5) -> Optional[str]:
-    """Extract entity candidates from *text* and query KG for each.
-
-    Returns None immediately when L1.5 is disabled via
-    CHATD_LAYER_15_ENABLED=false.
-    """
-    if not LAYER_15_ENABLED:
-        return None
-
-    words = {
-        w.lower().strip(".,!?:;\"'()")
-        for w in text.split()
-        if len(w) > 3 and w.lower().strip(".,!?:;\"'()") not in _STOPWORDS
-    }
-    if not words:
-        return None
-
-    kg = _get_kg()
-    if kg is None:
-        return None
-
-    today = date.today().isoformat()
-    lines: list[str] = []
-    seen: set[str] = set()
-
-    for word in sorted(words)[:8]:
-        try:
-            triples = kg.query_entity(word, as_of=today)
-        except Exception as e:
-            log.debug("FastMemory: kg_recall_from_text entity=%s failed: %s", word, e)
-            continue
-        for t in triples:
-            key = f"{t['subject']}|{t['predicate']}|{t['object']}"
-            if key not in seen and t.get("current"):
-                seen.add(key)
-                lines.append(f"{t['subject']} {t['predicate']} {t['object']}")
-        if len(lines) >= max_results:
-            break
-
-    if not lines:
-        return None
-    result = "\n".join(lines[:max_results])
-    log.debug("FastMemory: kg_recall_from_text found %d facts", len(lines))
-    return result
-
-
-def invalidate() -> None:
-    """Close the KnowledgeGraph connection and clear the wake-up cache."""
-    global _kg
-    if _kg is not None:
-        try:
-            _kg.close()
-        except Exception:
-            pass
-        _kg = None
-    _wakeup_cached.cache_clear()
-    log.info("FastMemory: cache invalidated")
-
-
-# ── wake-up assembly ──────────────────────────────────────────────────────
+# ── identity ──────────────────────────────────────────────────────────────────
 
 def _read_identity() -> str:
     """Read identity.txt relative to this file."""
@@ -166,130 +50,80 @@ def _read_identity() -> str:
         return ""
 
 
-def _read_kg_block(limit: int = 60) -> str:
-    """Return the most recent KG triples as a text block via KnowledgeGraph."""
-    kg = _get_kg()
-    if kg is None:
-        return ""
+# ── KG snippet via MCP ────────────────────────────────────────────────────────
+
+def _kg_snippet_via_mcp(limit: int = 60) -> str:
+    """Fetch a KG snippet via MCP. Returns "" on any failure."""
     try:
-        triples = kg.timeline()
-        today = date.today().isoformat()
-        current = [
-            t for t in reversed(triples)
-            if (t["valid_to"] is None or t["valid_to"] >= today)
-            and (t["valid_from"] is None or t["valid_from"] <= today)
-        ][:limit]
-        return "\n".join(
-            f"{t['subject']} {t['predicate']} {t['object']}" for t in current
-        )
+        import mcp_registry
     except Exception as e:
-        log.warning("FastMemory: KG block read failed: %s", e)
+        log.debug("mcp_registry not available: %s", e)
         return ""
 
+    if not mcp_registry.has_tool("mempalace_kg_timeline"):
+        log.debug("mempalace_kg_timeline not registered, KG snippet empty")
+        return ""
 
-def _run_wakeup_subprocess() -> str:
-    """Fallback: execute 'python -m mempalace wake-up' via subprocess."""
-    import subprocess
-
-    venv_python = os.environ.get("CHATD_MCP_MEMPALACE", "").split()[0] or "python3"
-    env = {**os.environ, "MEMPALACE_PALACE_PATH": MEMPALACE_PALACE_PATH}
     try:
-        result = subprocess.run(
-            [venv_python, "-m", "mempalace", "wake-up"],
-            capture_output=True, text=True, timeout=10, env=env,
-        )
-        if result.returncode != 0:
-            log.warning(
-                "mempalace wake-up exited %d: %s",
-                result.returncode, result.stderr.strip(),
-            )
-        return result.stdout.strip()
+        result = mcp_registry.call_tool("mempalace_kg_timeline", {})
     except Exception as e:
-        log.warning("mempalace wake-up subprocess failed: %s", e)
+        log.warning("mempalace_kg_timeline call failed: %s", e)
         return ""
 
+    if not isinstance(result, dict):
+        return ""
+
+    timeline = result.get("timeline") or []
+    if not isinstance(timeline, list):
+        return ""
+
+    lines = []
+    for t in timeline[:limit]:
+        s = t.get("subject") or "?"
+        p = t.get("predicate") or "?"
+        o = t.get("object") or "?"
+        if t.get("current", True):
+            lines.append(f"{s} {p} {o}")
+    return "\n".join(lines)
+
+
+# ── wake-up assembly ──────────────────────────────────────────────────────────
 
 @functools.lru_cache(maxsize=1)
 def _wakeup_cached() -> str:
-    """Assemble always-loaded mempalace block (cached, single slot)."""
     identity = _read_identity()
-    kg_block = _read_kg_block()
-
-    if not kg_block:
-        log.info("FastMemory: KG empty or missing, falling back to subprocess wake-up")
-        return _run_wakeup_subprocess()
+    kg_block = _kg_snippet_via_mcp()
 
     parts = [p for p in (identity, kg_block) if p]
     text = "\n\n".join(parts)
-    log.info("FastMemory: wake-up assembled (%d chars, KnowledgeGraph)", len(text))
+    log.info("FastMemory: wake-up assembled (%d chars)", len(text))
     return text
 
 
 def wake_up() -> str:
-    """Assemble the always-loaded system-prompt block (L0 + L1 from mempalace)."""
+    """Assemble the always-loaded system-prompt block (L0 + L1)."""
     return _wakeup_cached()
+
+
+def invalidate() -> None:
+    """Clear the wake-up cache. Called after mempalace write operations."""
+    _wakeup_cached.cache_clear()
+    log.info("FastMemory: cache invalidated")
 
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
-def _check_palace(palace_path: str) -> bool:
-    p = Path(palace_path)
-    if not p.exists():
-        log.warning("mempalace: palace directory missing: %s", palace_path)
-        return False
-    if not p.is_dir():
-        log.warning("mempalace: palace path is not a directory: %s", palace_path)
-        return False
-    children = list(p.iterdir())
-    if not children:
-        log.warning("mempalace: palace directory is empty (not initialised?): %s", palace_path)
-        return False
-    log.info("mempalace: palace OK - %s (%d entries)", palace_path, len(children))
-    return True
-
-
-def _check_kg(kg_path: str) -> bool:
-    p = Path(kg_path)
-    if not p.exists():
-        log.warning("mempalace: KG database missing: %s", kg_path)
-        log.warning(
-            "mempalace: run 'python -m mempalace init' to create the database"
-        )
-        return False
-    try:
-        kg = KnowledgeGraph(db_path=kg_path)
-        count = len(kg.timeline())
-        kg.close()
-        log.info("mempalace: KG OK - %s (%d triples)", kg_path, count)
-        return True
-    except Exception as e:
-        log.warning("mempalace: KG open failed: %s - %s", kg_path, e)
-        return False
-
-
 def init() -> None:
-    """Run startup health checks and open the KnowledgeGraph connection."""
+    """Run startup health checks."""
     from mempalace import __version__ as mp_version
     log.info("mempalace: version %s", mp_version)
     log.info("FastMemory: layer flags - L1.5=%s", LAYER_15_ENABLED)
 
-    palace_path = os.path.expanduser(MEMPALACE_PALACE_PATH)
-    kg_path     = os.path.expanduser(MEMPALACE_KG_PATH)
-
-    palace_ok = _check_palace(palace_path)
-    kg_ok     = _check_kg(kg_path)
-
-    if palace_ok and kg_ok:
-        log.info("mempalace: all checks passed, opening KnowledgeGraph")
-        _get_kg()
+    identity = _read_identity()
+    if identity:
+        log.info("FastMemory: identity.txt loaded (%d chars)", len(identity))
     else:
-        issues = []
-        if not palace_ok:
-            issues.append(f"palace not found at {palace_path}")
-        if not kg_ok:
-            issues.append(f"KG not found at {kg_path}")
         log.warning(
-            "mempalace: degraded mode - %s. "
-            "Memory context will be empty until mempalace is initialised.",
-            "; ".join(issues),
+            "FastMemory: identity.txt missing or empty — wake-up will be "
+            "KG-only until it is created"
         )
