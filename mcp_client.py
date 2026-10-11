@@ -156,7 +156,7 @@ class MCPClient:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    async def _start_async(self) -> None:
+    async def _start_asyn(cself) -> None:
         self._stack = AsyncExitStack()
 
         if self.transport == "stdio":
@@ -175,13 +175,16 @@ class MCPClient:
             if _HTTP_NEW_API:
                 http_client = create_mcp_http_client(headers=headers or None)
                 await self._stack.enter_async_context(http_client)
-                read, write, _ = await self._stack.enter_async_context(
+                streams = await self._stack.enter_async_context(
                     streamable_http_client(self.url, http_client=http_client)
                 )
+                # Newer SDK returns TransportStreams (2-tuple); older returns 3-tuple.
+                read, write = streams[0], streams[1]
             else:
-                read, write, _ = await self._stack.enter_async_context(
+                streams = await self._stack.enter_async_context(
                     streamable_http_client(self.url, headers=headers)
                 )
+                read, write = streams[0], streams[1]
         else:
             raise ValueError(f"unknown transport: {self.transport}")
 
