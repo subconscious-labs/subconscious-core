@@ -17,6 +17,7 @@ from flask import Flask, request, Response, jsonify, stream_with_context
 
 import backends
 import background
+import internal_tools
 import memory
 import rag
 import session as sess
@@ -522,6 +523,16 @@ def load_tools():
             })
             log.debug("[tools] registered: %s", name)
 
+    # Internal tools (in-process, not MCP) — chat-only.
+    for schema in internal_tools.get_schemas():
+        fn = schema.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        tools.append(schema)
+        registry[name] = None      # marker: not an MCP client
+        log.debug("[tools] registered internal: %s", name)
+
     return tools, registry, clients
 
 
@@ -531,7 +542,7 @@ def _stop_all_mcp_clients() -> None:
             client.stop()
         except Exception as e:
             log.debug("[mcp] atexit stop error: %s", e)
- 
+
 
 def init_tools():
     global TOOLS, TOOL_REGISTRY, _MCP_CLIENTS
@@ -545,6 +556,14 @@ def init_tools():
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     """Invoke a tool by name."""
+    if internal_tools.is_internal(name):
+        log.debug("[tool] calling internal %s with args: %s", name, arguments)
+        result = internal_tools.call_internal(name, arguments)
+        if name in ("subcortex_goals_create", "subcortex_goals_cancel"):
+            # Ledger changed — goal list may be embedded in cached wake-up.
+            sess.invalidate_all_prompt_caches()
+        return result
+
     client = TOOL_REGISTRY.get(name)
     if client is None:
         log.error("[tool] unknown tool requested: %s", name)

@@ -15,10 +15,16 @@ REGISTRY: Dict[str, Any] = {}   # tool_name -> MCPClient
 
 
 def reset(tools: List[Dict], registry: Dict[str, Any]) -> None:
-    """Replace the registry. Called once at startup by chatd.init_tools()."""
+    """Replace the registry. Called once at startup by chatd.init_tools().
+
+    Internal tools (in-process, registered with client=None) stay in TOOLS
+    so they reach the LLM schema, but are excluded from REGISTRY — the
+    background tick calls into mcp_registry, and internal tools must not be
+    reachable through that path.
+    """
     global TOOLS, REGISTRY
     TOOLS = tools
-    REGISTRY = registry
+    REGISTRY = {k: v for k, v in registry.items() if v is not None}
 
 
 def get_client(tool_name: str) -> Optional[Any]:

@@ -681,6 +681,10 @@ def _execute_tool_call(tc: Dict[str, Any]) -> Any:
             args = json.loads(args)
         except json.JSONDecodeError:
             args = {}
+    # Defense in depth: the tool schema list already excludes internal tools
+    # (not in BG_TOOLS_ALLOWED), but if the model hallucinates one, reject.
+    if name not in BG_TOOLS_ALLOWED:
+        return {"error": f"tool not allowed in background: {name}"}
     try:
         return chatd.call_tool(name, args)
     except Exception as e:  # noqa: BLE001
