@@ -38,7 +38,7 @@ def _env(name: str, default: str = "") -> str:
 
 
 # ── Thinking mode ────────────────────────────────────────────────────────────────────
-THINKING: bool = _env("THINKING", "false").lower() == "true"
+THINKING: bool = _env("BG_THINKING", "false").lower() == "true"
 
 # ── Tools ────────────────────────────────────────────────────────────────────────
 TOOLS_FILTER: bool = os.environ.get("CHATD_TOOLS_FILTER", "false").lower() == "true"
