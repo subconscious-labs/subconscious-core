@@ -103,10 +103,10 @@ OPENROUTER_API_MODELS: List[str] = [
 # Optional shared secret for /api/event.
 # If set, caller must pass Authorization: Bearer <token>.
 # If empty - endpoint is open (only for trusted internal networks).
-CHATD_EVENT_TOKEN: str = os.environ.get("CHATD_EVENT_TOKEN", "")
+CHATD_EVENT_TOKEN: str = _env("EVENT_TOKEN", "")
 
 # Model used to process incoming events (can differ from chat model).
-CHATD_EVENT_MODEL: str = os.environ.get("CHATD_EVENT_MODEL", "")
+CHATD_EVENT_MODEL: str = _env("EVENT_MODEL", "")
 
 # ── MCP auto-discovery prefix ─────────────────────────────────────────────────
 MCP_ENV_PREFIX: str = "CHATD_MCP_"
@@ -121,7 +121,7 @@ def _load_tool_descriptions() -> Dict[str, str]:
         str(bundled),
         "/etc/chatd/tool_descriptions.ini",
         os.path.expanduser("~/.config/chatd/tool_descriptions.ini"),
-        os.environ.get("CHATD_TOOL_DESCRIPTIONS", ""),
+        _env("TOOL_DESCRIPTIONS", ""),
     ]
     cfg.read([p for p in paths if p])
     return {
@@ -137,8 +137,8 @@ DEEPSEEK_API: str = _env("DEEPSEEK_API", "https://api.deepseek.com")
 
 DEEPSEEK_API_MODELS = [
     m.strip()
-    for m in os.environ.get(
-        "CHATD_DEEPSEEK_MODELS",
+    for m in _env(
+        "DEEPSEEK_MODELS",
         "deepseek-flash",
     ).split(",")
     if m.strip()
