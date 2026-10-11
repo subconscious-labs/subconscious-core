@@ -531,7 +531,7 @@ def _stop_all_mcp_clients() -> None:
             client.stop()
         except Exception as e:
             log.debug("[mcp] atexit stop error: %s", e)
-
+ 
 
 def init_tools():
     global TOOLS, TOOL_REGISTRY, _MCP_CLIENTS

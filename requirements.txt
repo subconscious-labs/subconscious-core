@@ -3,6 +3,5 @@ fastmcp==3.4.5
 gevent==26.7.0
 gunicorn==26.0.0
 mcp==1.29.0
-mempalace==3.6.0
 requests==2.33.1
 sqlite-vec==0.1.9
