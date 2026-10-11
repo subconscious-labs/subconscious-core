@@ -156,7 +156,7 @@ class MCPClient:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    async def _start_asyn(cself) -> None:
+    async def _start_async(self) -> None:
         self._stack = AsyncExitStack()
 
         if self.transport == "stdio":
@@ -178,7 +178,8 @@ class MCPClient:
                 streams = await self._stack.enter_async_context(
                     streamable_http_client(self.url, http_client=http_client)
                 )
-                # Newer SDK returns TransportStreams (2-tuple); older returns 3-tuple.
+                # Newer SDK returns 2-tuple (TransportStreams);
+                # older returns 3-tuple. Slicing works for both.
                 read, write = streams[0], streams[1]
             else:
                 streams = await self._stack.enter_async_context(
@@ -192,6 +193,7 @@ class MCPClient:
             ClientSession(read, write)
         )
         await self._session.initialize()
+
 
     def start(self) -> None:
         self._loop = asyncio.new_event_loop()
