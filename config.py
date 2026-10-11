@@ -6,12 +6,39 @@ can be installed anywhere without modifying source files.  Copy .env.example
 to .env (or set Environment= in the systemd unit) and adjust as needed.
 """
 import configparser
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
+_env_log = logging.getLogger("chatd.config")
+_env_warned: set = set()
+
+
+MCP_ENV_PREFIXES = ("SUBCONSCIOUS_MCP_", "CHATD_MCP_")
+
+
+def _env(name: str, default: str = "") -> str:
+    """Read env with backward-compat:
+       SUBCONSCIOUS_* > CHATD_* > default.
+    Warns once per name when falling back to CHATD_*."""
+    new = os.environ.get(f"SUBCONSCIOUS_{name}")
+    if new is not None:
+        return new
+    old = os.environ.get(f"CHATD_{name}")
+    if old is not None:
+        if name not in _env_warned:
+            _env_warned.add(name)
+            _env_log.warning(
+                "CHATD_%s is deprecated; use SUBCONSCIOUS_%s",
+                name, name,
+            )
+        return old
+    return default
+
+
 # ── Thinking mode ────────────────────────────────────────────────────────────────────
-THINKING: bool = os.environ.get("CHATD_THINKING", "false").lower() == "true"
+THINKING: bool = _env("THINKING", "false").lower() == "true"
 
 # ── Tools ────────────────────────────────────────────────────────────────────────
 TOOLS_FILTER: bool = os.environ.get("CHATD_TOOLS_FILTER", "false").lower() == "true"

@@ -115,8 +115,6 @@ def invalidate() -> None:
 
 def init() -> None:
     """Run startup health checks."""
-    from mempalace import __version__ as mp_version
-    log.info("mempalace: version %s", mp_version)
     log.info("FastMemory: layer flags - L1.5=%s", LAYER_15_ENABLED)
 
     identity = _read_identity()
