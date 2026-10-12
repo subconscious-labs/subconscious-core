@@ -58,6 +58,7 @@ from config import (
     BG_MAX_TOOL_ROUNDS,
     BG_EXPLORATORY_PER_DAY,
     BG_EXPLORATORY_TTL_HOURS,
+    BG_EXPLORATORY_MIN_INTERVAL_MIN,
     BG_PHASE_TIMEOUT,
     BG_PHASE_TIMEOUT_EXECUTOR,
     BG_PHASE_TIMEOUT_EXPLORATORY,
@@ -71,6 +72,7 @@ from config import (
     BG_MAX_NEW_GOALS_PER_DAY,
     BG_JOURNAL_MAX_MB,
     BG_JOURNAL_KEEP,
+    BG_SKIP_WITH_OPEN_GOALS_STOPS_TICK,
     BG_PROMPT_PLANNER,
     BG_PROMPT_EXECUTOR,
     BG_PROMPT_EXPLORATORY,
@@ -186,19 +188,25 @@ _EXPLORATORY_INSTRUCTIONS = BG_PROMPT_EXPLORATORY or _DEFAULT_EXPLORATORY_INSTRU
 _REFLECTOR_INSTRUCTIONS = BG_PROMPT_REFLECTOR or _DEFAULT_REFLECTOR_INSTRUCTIONS
 
 _EXPLORATORY_SEED_PREFERENCE = [
+    # external signals first - actual changes in the environment
     "alerts_list",
+    "alerts_summary",
+    "monitor_query",
+    "notes_search",
+    "meta_list_servers",
+    "meta_search",
+    # memory introspection - useful but easy to loop on
     "mempalace_kg_timeline",
     "mempalace_status",
     "mempalace_kg_stats",
-    "mempalace_graph_stats",
     "mempalace_list_wings",
-    "mempalace_list_rooms",
     "mempalace_get_taxonomy",
+    # rarely useful as seed (mostly counts and structural metadata)
+    "mempalace_graph_stats",
+    "mempalace_list_rooms",
     "mempalace_find_tunnels",
     "mempalace_mesh_peers",
     "mempalace_list_tunnels",
-    "monitor_query",
-    "notes_search",
 ]
 
 
@@ -500,6 +508,37 @@ def _exploratory_created_today(goals: List[Dict[str, Any]]) -> int:
     )
 
 
+def _last_exploratory_timestamp(goals: List[Dict[str, Any]]) -> Optional[datetime]:
+    """Return the most recent created_at among exploratory goals, or None."""
+    latest: Optional[datetime] = None
+    for g in goals:
+        if g.get("kind") != "exploratory":
+            continue
+        created = g.get("created_at")
+        if not created:
+            continue
+        try:
+            ts = datetime.strptime(
+                created[:19], "%Y-%m-%dT%H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _exploratory_min_interval_ok(goals: List[Dict[str, Any]]) -> bool:
+    """Return True if enough time has passed since the last exploratory."""
+    if BG_EXPLORATORY_MIN_INTERVAL_MIN <= 0:
+        return True
+    last = _last_exploratory_timestamp(goals)
+    if last is None:
+        return True
+    elapsed_min = (datetime.now(timezone.utc) - last).total_seconds() / 60.0
+    return elapsed_min >= BG_EXPLORATORY_MIN_INTERVAL_MIN
+
+
 def _new_goal(title: str, kind: str) -> Dict[str, Any]:
     now = _now_iso()
     return {
@@ -714,6 +753,33 @@ def _read_recent_normal_goals(limit: int = 5) -> List[Dict[str, Any]]:
             items.append(g)
     items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return items[:limit]
+
+
+def _read_recent_archive(limit: int = 30) -> List[Dict[str, Any]]:
+    """Return the last `limit` entries from goals.archive.jsonl.
+
+    Used by exploratory accounting, which must see completed goals too —
+    otherwise daily cap and min-interval reset every time an exploratory
+    finishes and moves to the archive.
+    """
+    items: List[Dict[str, Any]] = []
+    path = _goals_archive_path()
+    if not path.exists():
+        return items
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            tail = deque(f, maxlen=limit)
+        for line in tail:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return items
 
 
 def _planner() -> Dict[str, Any]:
@@ -989,6 +1055,9 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         outcome = parsed.get("outcome") if parsed.get("outcome") in (
             "done", "partial", "failed"
         ) else "done"
+        useful = parsed.get("useful")
+        if not isinstance(useful, bool):
+            useful = None
         observation = str(parsed.get("observation") or "").strip()
         if not observation:
             observation = "(empty observation)"
@@ -1013,6 +1082,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
             "new_status": "done",
             "new_goals": new_goals,
             "title": title,
+            "useful": useful,
         }
 
 
@@ -1217,7 +1287,8 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         # possible, skip outright.
         goals_now = _read_goals()
         open_now = _open_goals(goals_now["goals"])
-        made_today = _exploratory_created_today(goals_now["goals"])
+        combined = goals_now["goals"] + _read_recent_archive()
+        made_today = _exploratory_created_today(combined)
         if not open_now and made_today >= BG_EXPLORATORY_PER_DAY:
             log.info("[bg %s] short-circuit: no open goals, exploratory cap "
                      "reached (%d/%d)", req_id, made_today,
@@ -1286,10 +1357,37 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     if remaining <= 0:
         raise TimeoutError("tick deadline exceeded after planner")
 
+    # If planner skipped but open goals exist, end the tick. The goal
+    # the planner refused to pick won't magically become pickable by
+    # running an exploratory step; and exploratory tends to introspect.
+    if (picked_goal is None
+            and BG_SKIP_WITH_OPEN_GOALS_STOPS_TICK
+            and decision.get("decision") == "skip"):
+        goals_now = _read_goals()
+        open_now = _open_goals(goals_now["goals"])
+        if open_now:
+            log.info(
+                "[bg %s] planner skipped with %d open goals — stopping",
+                req_id, len(open_now),
+            )
+            _append_journal({
+                "req_id": req_id, "ts": _now_iso(),
+                "status": "skipped",
+                "reason": "planner_skipped_with_open_goals",
+                "open_count": len(open_now),
+            })
+            return {
+                "req_id": req_id,
+                "status": "skipped",
+                "reason": "planner_skipped_with_open_goals",
+                "open_count": len(open_now),
+            }
+
     # ── Executor - runs picked goal, or explores read-only ─────────────
     if picked_goal is None:
         goals = _read_goals()
-        made_today = _exploratory_created_today(goals["goals"])
+        combined = goals["goals"] + _read_recent_archive()
+        made_today = _exploratory_created_today(combined)
         if made_today >= BG_EXPLORATORY_PER_DAY:
             log.info("[bg %s] exploratory cap reached (%d/%d)",
                      req_id, made_today, BG_EXPLORATORY_PER_DAY)
@@ -1297,6 +1395,15 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 "req_id": req_id,
                 "status": "skipped",
                 "reason": "exploratory_cap_reached",
+            }
+        if not _exploratory_min_interval_ok(combined):
+            log.info("[bg %s] exploratory min interval not elapsed "
+                     "(%d min required)",
+                     req_id, BG_EXPLORATORY_MIN_INTERVAL_MIN)
+            return {
+                "req_id": req_id,
+                "status": "skipped",
+                "reason": "exploratory_min_interval",
             }
         # Note: no need to check _active_exploratory here - if there was an
         # active one, we would have auto-resumed it above.
@@ -1358,6 +1465,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         "outcome": executor_result["outcome"],
         "tool_calls": executor_result.get("tool_calls", 0),
         "tokens": executor_result["tokens"],
+        "useful": executor_result.get("useful"),
     })
 
     # Persist executor result
@@ -1444,6 +1552,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         "observation": executor_result["observation"],
         "tokens": tokens_used,
         "elapsed_ms": int(elapsed * 1000),
+        "useful": executor_result.get("useful"),
     }
     _append_journal({
         "req_id": req_id, "ts": _now_iso(),

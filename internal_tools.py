@@ -37,7 +37,9 @@ _SCHEMAS: List[Dict[str, Any]] = [
                 "List background goals (the subconscious worker's ledger). "
                 "Use this when the user asks what the background agent is "
                 "working on, or wants to see open/blocked/done goals. "
-                "Returns compact entries without history."
+                "Returns compact but complete entries - do NOT call "
+                "subcortex_goals_get for goals already returned by list. Use "
+                "get only when you need full history of a specific goal."
             ),
             "parameters": {
                 "type": "object",
@@ -121,13 +123,20 @@ _SCHEMAS: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "goal_id": {"type": "string"},
+                    "goal_id": {
+                        "type": "string",
+                        "description": "Single goal id (legacy)."
+                    },
+                    "goal_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Multiple goal ids to cancel at once."
+                    },
                     "reason": {
                         "type": "string",
                         "description": "Why cancelled. Goes into history.",
                     },
                 },
-                "required": ["goal_id"],
             },
         },
     },
@@ -137,8 +146,9 @@ _SCHEMAS: List[Dict[str, Any]] = [
             "name": "subcortex_journal_tail",
             "description": (
                 "Return the most recent entries from the background worker's "
-                "journal (append-only tick log). Use this to check what the "
-                "subconscious did recently."
+                "journal (append-only tick log). Use this when the user asks "
+                "what the background worker did recently, or when you need to "
+                "understand why a goal was created or cancelled."
             ),
             "parameters": {
                 "type": "object",
@@ -318,36 +328,60 @@ def _create_goal(args: Dict[str, Any]) -> Dict[str, Any]:
 def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
     import background
 
-    goal_id = (args.get("goal_id") or "").strip()
-    if not goal_id:
-        return {"error": "goal_id is required"}
+    ids: List[str] = []
+    single = (args.get("goal_id") or "").strip()
+    if single:
+        ids.append(single)
+    multi = args.get("goal_ids") or []
+    if isinstance(multi, list):
+        for gid in multi:
+            if isinstance(gid, str) and gid.strip():
+                ids.append(gid.strip())
+
+    if not ids:
+        return {"error": "goal_id or goal_ids required"}
+
     reason = (args.get("reason") or "").strip()
 
     lock = _acquire_ledger_lock()
     if lock is None:
-        return {
-            "error": "background tick is running; try again in a minute"
-        }
+        return {"error": "background tick is running; try again in a minute"}
     try:
         goals = background._read_goals()
-        target = background._find_goal(goals.get("goals", []), goal_id)
-        if target is None:
-            return {"error": f"goal not found in active ledger: {goal_id}"}
-        if target.get("status") in ("done", "cancelled"):
-            return {
-                "error": f"goal already {target.get('status')}: {goal_id}"
-            }
         now = _iso()
-        target["status"] = "cancelled"
-        target["updated_at"] = now
-        target.setdefault("history", []).append({
-            "ts":    now,
-            "event": "cancelled",
-            "by":    "user",
-            "note":  reason or "(no reason given)",
-        })
-        background._write_goals(goals)
-        return {"cancelled": _compact_goal(target)}
+        cancelled: List[Dict[str, Any]] = []
+        not_found: List[str] = []
+        already_closed: List[Dict[str, str]] = []
+
+        for gid in ids:
+            target = background._find_goal(goals.get("goals", []), gid)
+            if target is None:
+                not_found.append(gid)
+                continue
+            if target.get("status") in ("done", "cancelled"):
+                already_closed.append({
+                    "id": gid, "status": target.get("status"),
+                })
+                continue
+            target["status"] = "cancelled"
+            target["updated_at"] = now
+            target.setdefault("history", []).append({
+                "ts":    now,
+                "event": "cancelled",
+                "by":    "user",
+                "note":  reason or "(no reason given)",
+            })
+            cancelled.append(_compact_goal(target))
+
+        if cancelled:
+            background._write_goals(goals)
+
+        return {
+            "cancelled_count": len(cancelled),
+            "cancelled":       cancelled,
+            "not_found":       not_found,
+            "already_closed":  already_closed,
+        }
     finally:
         lock.release()
 

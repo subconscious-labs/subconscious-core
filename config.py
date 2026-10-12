@@ -178,8 +178,12 @@ BG_MAX_TOOL_ROUNDS: int = int(_env("BG_MAX_TOOL_ROUNDS", "5"))
 BG_TOOLS_ALLOWED: Set[str] = set(
     _env(
         "BG_TOOLS_ALLOWED",
+        # mempalace
         "mempalace_search,mempalace_kg_query,mempalace_status,"
-        "mempalace_wake_up,mempalace_kg_timeline,"
+        "mempalace_kg_timeline,"
+        # external signals (via lazy-mcp)
+        "meta_list_servers,meta_search,meta_call,meta_describe_tool,"
+        # direct MCP where available
         "alerts_list,alerts_summary,monitor_query,notes_search",
     ).split(",")
 )
@@ -218,6 +222,12 @@ BG_MAX_OPEN_GOALS: int = int(_env("BG_MAX_OPEN_GOALS", "5"))
 #  - hard cap per day
 BG_EXPLORATORY_PER_DAY: int = int(_env("BG_EXPLORATORY_PER_DAY", "3"))
 BG_EXPLORATORY_TTL_HOURS: int = int(_env("BG_EXPLORATORY_TTL_HOURS", "24"))
+# Minimum minutes between two exploratory ticks. Prevents back-to-back
+# introspections when the planner returns skip repeatedly.
+# 0 = no limit.
+BG_EXPLORATORY_MIN_INTERVAL_MIN: int = int(
+    _env("BG_EXPLORATORY_MIN_INTERVAL_MIN", "90")
+)
 
 # Daily budget. 0 = no limit. Token counting relies on Ollama's
 # prompt_eval_count + eval_count; OpenAI-compatible backends currently do
@@ -236,6 +246,13 @@ BG_JOURNAL_MAX_MB: int = int(_env("BG_JOURNAL_MAX_MB", "10"))
 # How many rotated journal files to keep. 0 = keep all.
 BG_JOURNAL_KEEP: int = int(_env("BG_JOURNAL_KEEP", "5"))
 
+# If planner returns skip while open goals exist, end the tick without
+# running an exploratory step. Exploratory is for "nothing to do at all",
+# not for "couldn't decide which goal to pick". Without this, a pending
+# goal the planner won't touch causes endless introspection loops.
+BG_SKIP_WITH_OPEN_GOALS_STOPS_TICK: bool = (
+    _env("BG_SKIP_WITH_OPEN_GOALS_STOPS_TICK", "true").lower() == "true"
+)
 
 # ── Background prompts (layered override) ────────────────────────────────────
 # Each background prompt has a bundled default in ./prompts/<name>.txt.
