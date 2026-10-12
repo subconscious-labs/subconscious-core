@@ -25,20 +25,12 @@ from typing import Optional
 from config import (
     MEMPALACE_PALACE_PATH,  # kept for backwards compat / logging
     MEMORY_KG_SNIPPET_LIMIT,
+    _env,
 )
 
 log = logging.getLogger("chatd.memory")
 
-# ── Layer feature flags ───────────────────────────────────────────────────────
-
-def _bool_env(name: str, default: bool = True) -> bool:
-    val = os.environ.get(name, "").strip().lower()
-    if not val:
-        return default
-    return val not in ("false", "0", "no", "off")
-
-
-LAYER_15_ENABLED: bool = _bool_env("CHATD_LAYER_15_ENABLED", default=True)
+LAYER_15_ENABLED: bool = _env("LAYER_15_ENABLED", "true").lower() == "true"
 
 
 # ── identity ──────────────────────────────────────────────────────────────────

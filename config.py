@@ -114,9 +114,6 @@ CHATD_EVENT_TOKEN: str = _env("EVENT_TOKEN", "")
 # Model used to process incoming events (can differ from chat model).
 CHATD_EVENT_MODEL: str = _env("EVENT_MODEL", "")
 
-# ── MCP auto-discovery prefix ─────────────────────────────────────────────────
-MCP_ENV_PREFIX: str = "CHATD_MCP_"
-
 # ── Tool description overrides ────────────────────────────────────────────────
 TOOL_OVERRIDE: bool = _env("TOOL_OVERRIDE", "false").lower() == "true"
 
@@ -241,6 +238,24 @@ BG_EXPLORATORY_MIN_INTERVAL_MIN: int = int(
 BG_DAILY_TOKEN_BUDGET: int = int(_env("BG_DAILY_TOKEN_BUDGET", "0"))
 BG_DAILY_TIME_BUDGET_SEC: int = int(_env("BG_DAILY_TIME_BUDGET_SEC", "0"))
 
+# ── Cloud model budget + soft degrade ────────────────────────────────────
+# Any model whose name starts with one of these prefixes is "cloud" for the
+# purpose of the cloud daily token budget.
+BG_CLOUD_PREFIXES: Set[str] = set(
+    p.strip() for p in _env("BG_CLOUD_PREFIXES", "deepseek/,or/").split(",")
+    if p.strip()
+)
+
+# Daily cloud token budget. 0 = unlimited. When the limit is reached,
+# cloud models are replaced with a local fallback for the rest of the day.
+BG_CLOUD_DAILY_TOKEN_BUDGET: int = int(
+    _env("BG_CLOUD_DAILY_TOKEN_BUDGET", "0")
+)
+
+# Model to use when cloud budget is exhausted. If empty, BG_MODEL is used
+# (which should be a local model).
+BG_DEGRADE_MODEL: str = _env("BG_DEGRADE_MODEL", "qwen3.5:9b")
+
 # Daily cap on new normal goals created by the planner. Prevents the 4B
 # model from inventing goals indefinitely when nothing changes.
 BG_MAX_NEW_GOALS_PER_DAY: int = int(_env("BG_MAX_NEW_GOALS_PER_DAY", "3"))
@@ -322,8 +337,7 @@ def _load_bg_prompt(name: str) -> str:
                     return text
             except Exception:
                 continue
-    env_key = f"CHATD_BG_PROMPT_{name.upper()}"
-    return os.environ.get(env_key, "")
+    return _env(f"BG_PROMPT_{name.upper()}", "")
 
 
 BG_PROMPT_PLANNER: str = _load_bg_prompt("planner")

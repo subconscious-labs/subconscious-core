@@ -69,6 +69,9 @@ from config import (
     BG_TICK_TIMEOUT,
     BG_DAILY_TOKEN_BUDGET,
     BG_DAILY_TIME_BUDGET_SEC,
+    BG_CLOUD_PREFIXES,
+    BG_CLOUD_DAILY_TOKEN_BUDGET,
+    BG_DEGRADE_MODEL,
     BG_NUM_PREDICT,
     BG_SESSION_ID,
     BG_STATE_DIR,
@@ -362,6 +365,7 @@ def _empty_budget() -> Dict[str, Any]:
         "date": _today_utc(),
         "tokens_used": 0,
         "time_used_sec": 0,
+        "cloud_tokens_used": 0,
     }
 
 
@@ -385,13 +389,59 @@ def _budget_allows_new_tick() -> Optional[str]:
     return None
 
 
-def _budget_add(tokens: int, elapsed_sec: float) -> None:
-    if BG_DAILY_TOKEN_BUDGET <= 0 and BG_DAILY_TIME_BUDGET_SEC <= 0:
+def _budget_add_llm(tokens: int, is_cloud: bool) -> None:
+    """Called after each LLM call. Updates token counters.
+
+    Cloud tokens are always counted (so the operator can observe usage even
+    without a budget); total tokens are also tracked for BG_DAILY_TOKEN_BUDGET.
+    """
+    if tokens <= 0:
         return
     b = _read_budget()
-    b["tokens_used"] += int(tokens)
-    b["time_used_sec"] += int(elapsed_sec)
+    b["tokens_used"] = int(b.get("tokens_used", 0)) + int(tokens)
+    if is_cloud:
+        b["cloud_tokens_used"] = int(b.get("cloud_tokens_used", 0)) + int(tokens)
     _atomic_write_json(_budget_path(), b)
+
+
+def _budget_add_time(elapsed_sec: float) -> None:
+    """Called once per tick. Updates the time counter."""
+    if BG_DAILY_TIME_BUDGET_SEC <= 0:
+        return
+    b = _read_budget()
+    b["time_used_sec"] = int(b.get("time_used_sec", 0)) + int(elapsed_sec)
+    _atomic_write_json(_budget_path(), b)
+
+
+def _is_cloud(model: str) -> bool:
+    """Return True if *model* is a cloud model (prefix match)."""
+    return any(model.startswith(p) for p in BG_CLOUD_PREFIXES)
+
+
+def _resolve_model(model: str, phase: str) -> tuple[str, Optional[str]]:
+    """Return (effective_model, degrade_reason).
+
+    If *model* is a cloud model and the cloud daily token budget is
+    exhausted, replace it with BG_DEGRADE_MODEL (or BG_MODEL). Otherwise
+    return as-is with degrade_reason=None.
+    """
+    if not _is_cloud(model):
+        return model, None
+    if BG_CLOUD_DAILY_TOKEN_BUDGET <= 0:
+        return model, None
+    b = _read_budget()
+    used = int(b.get("cloud_tokens_used", 0))
+    if used < BG_CLOUD_DAILY_TOKEN_BUDGET:
+        return model, None
+    fallback = BG_DEGRADE_MODEL or BG_MODEL
+    reason = (
+        f"cloud budget exhausted ({used}/{BG_CLOUD_DAILY_TOKEN_BUDGET} tokens), "
+        f"degraded {phase} to {fallback}"
+    )
+    log.info("[bg %s] %s", phase, reason)
+    return fallback, reason
+
+
 
 
 # ── phase timeout helper ──────────────────────────────────────────────────────
@@ -629,6 +679,8 @@ def _llm_call(
     resp = backend.chat_sync(body)
     msg = resp.get("message") or {}
     tokens = int(resp.get("prompt_eval_count") or 0) + int(resp.get("eval_count") or 0)
+    if tokens > 0:
+        _budget_add_llm(tokens, _is_cloud(model))
     return {
         "content": msg.get("content") or "",
         "tool_calls": msg.get("tool_calls") or [],
@@ -784,6 +836,7 @@ def _read_recent_archive(limit: int = 30) -> List[Dict[str, Any]]:
 
 def _planner() -> Dict[str, Any]:
     model = BG_MODEL_PLANNER or BG_MODEL
+    model, degrade_reason = _resolve_model(model, "planner")
     goals = _read_goals()
     open_list = _open_goals(goals["goals"])
     cap = BG_MAX_OPEN_GOALS
@@ -894,6 +947,7 @@ def _planner() -> Dict[str, Any]:
         "decision": decision,
         "model": model,
         "tokens": resp["tokens"],
+        "degraded": degrade_reason,
     }
 
 
@@ -1019,6 +1073,7 @@ def _executor_tool_loop(
 
 def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
     model = BG_MODEL_EXECUTOR or BG_MODEL
+    model, degrade_reason = _resolve_model(model, "executor")
     kind = goal.get("kind", "normal")
     tools = _allowed_tools_for(kind)
 
@@ -1108,6 +1163,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
             "new_goals": new_goals,
             "title": title,
             "useful": useful,
+            "degraded": degrade_reason,
         }
 
 
@@ -1177,6 +1233,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         "observation": observation,
         "new_status": new_status,
         "new_goals": new_goals,
+        "degraded": degrade_reason,
     }
 
 
@@ -1184,6 +1241,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
 
 def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
     model = BG_MODEL_REFLECTOR or BG_MODEL
+    model, degrade_reason = _resolve_model(model, "reflector")
     history_lines = []
     for h in (goal.get("history") or [])[-10:]:
         history_lines.append(
@@ -1224,8 +1282,10 @@ def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
     d = parsed.get("decision")
     if d not in ("retry", "cancel", "keep_blocked"):
         d = "keep_blocked"
+
     return {"decision": d, "reason": parsed.get("reason", ""),
-            "model": model, "tokens": resp["tokens"]}
+            "model": model, "tokens": resp["tokens"],
+            "degraded": degrade_reason}
 
 
 # ── ledger update helpers ─────────────────────────────────────────────────────
@@ -1344,6 +1404,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             "ts": _now_iso(),
             "phase": "planner",
             "model": planner_result["model"],
+            "degraded": planner_result.get("degraded"),
             "decision": decision,
         })
         log.info("[bg %s] planner: %s", req_id, decision.get("decision"))
@@ -1493,6 +1554,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         "ts": _now_iso(),
         "phase": "executor",
         "model": executor_result["model"],
+        "degraded": executor_result.get("degraded"),
         "outcome": executor_result["outcome"],
         "tool_calls": executor_result.get("tool_calls", 0),
         "tokens": executor_result["tokens"],
@@ -1548,6 +1610,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             _append_journal({
                 "req_id": req_id, "ts": _now_iso(),
                 "phase": "reflector", "model": refl["model"],
+                "degraded": refl.get("degraded"),
                 "decision": refl["decision"], "tokens": refl["tokens"],
             })
 
@@ -1572,7 +1635,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 _write_goals(goals)
 
     elapsed = time.time() - started
-    _budget_add(tokens_used, elapsed)
+    _budget_add_time(elapsed)
 
     result = {
         "req_id": req_id,
