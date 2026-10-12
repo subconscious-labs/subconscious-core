@@ -263,6 +263,13 @@ class DeepSeekBackend:
             result["message"]["tool_calls"] = _finalise_tc(tc_acc)
         if reasoning_acc:
             result["message"]["reasoning_content"] = reasoning_acc
+
+        log.info("[deepseek chat_sync] finish_reason=%s, content_len=%d, reasoning_len=%d, usage=%s",
+                 result.get("done_reason"),
+                 len(result["message"].get("content") or ""),
+                 len(result["message"].get("reasoning_content") or ""),
+                 (data.get("usage") or {}).get("completion_tokens_details"))
+
         return result
 
     def chat_stream(self, payload: Dict[str, Any]) -> Generator[bytes, None, None]:
