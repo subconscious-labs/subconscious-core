@@ -602,6 +602,7 @@ def _llm_call(
     model: str,
     tools: Optional[List[Dict[str, Any]]] = None,
     num_predict: Optional[int] = None,
+    response_format: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Single backend call. Returns {content, tool_calls, tokens, raw}."""
     import backends
@@ -610,12 +611,15 @@ def _llm_call(
     options = dict(DEFAULT_OPTIONS)
     if num_predict is not None:
         options["num_predict"] = num_predict
+    if response_format is not None:
+        options["response_format"] = response_format
     body: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": False,
         "options": options,
     }
+
     if tools:
         body["tools"] = tools
     if not THINKING:
@@ -830,7 +834,14 @@ def _planner() -> Dict[str, Any]:
         {"role": "user", "content": user_text},
     ]
 
-    resp = _llm_call(messages, model, tools=None, num_predict=BG_NUM_PREDICT)
+    resp = _llm_call(messages, model, tools=None,
+                     num_predict=BG_NUM_PREDICT,
+                     response_format="json")
+    _raw_msg = resp["raw"].get("message") or {}
+    _c = resp["content"] or ""
+    _r = _raw_msg.get("reasoning_content") or ""
+    log.info("[bg planner] content(%d)=%r", len(_c), _c[:400])
+    log.info("[bg planner] reasoning(%d)=%r", len(_r), _r[:400])
     decision = _extract_json(resp["content"]) or {}
 
     d = decision.get("decision")
@@ -1043,7 +1054,8 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         tokens_total = 0
         try:
             resp = _llm_call(messages, model, tools=None,
-                             num_predict=BG_NUM_PREDICT)
+                             num_predict=BG_NUM_PREDICT,
+                             response_format="json")
             tokens_total = resp["tokens"]
             parsed = _extract_json(resp["content"]) or {}
         except Exception as e:

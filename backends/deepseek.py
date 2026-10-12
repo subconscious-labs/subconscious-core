@@ -93,6 +93,13 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
         "stream":   stream,
     }
 
+    # Force JSON output for planner/reflector-like calls where the caller
+    # expects a strict JSON object. DeepSeek Flash always emits reasoning
+    # and may otherwise wrap its JSON in prose.
+    options = payload.get("options") or {}
+    if options.get("response_format") == "json":
+        body["response_format"] = {"type": "json_object"}
+
     if payload.get("tools"):
         body["tools"] = payload["tools"]
         body["tool_choice"] = "auto"
