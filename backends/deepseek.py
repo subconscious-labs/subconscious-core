@@ -187,6 +187,8 @@ def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
             continue
 
         content = delta.get("content") or ""
+        if not content and not finish and not delta.get("tool_calls"):
+            continue
 
         out = {
             "model":   model,

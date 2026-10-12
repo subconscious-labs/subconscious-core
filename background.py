@@ -677,6 +677,20 @@ def _llm_call(
 
     backend = backends.get_backend(model)
     resp = backend.chat_sync(body)
+
+    _msg = resp.get("message") or {}
+    log.info(
+        "[bg llm] model=%s finish=%s content=%d reasoning=%d "
+        "tool_calls=%d prompt_tokens=%s eval_tokens=%s",
+        model,
+        resp.get("done_reason") or resp.get("finish_reason") or "?",
+        len(_msg.get("content") or ""),
+        len(_msg.get("reasoning_content") or ""),
+        len(_msg.get("tool_calls") or []),
+        resp.get("prompt_eval_count"),
+        resp.get("eval_count"),
+    )
+
     msg = resp.get("message") or {}
     tokens = int(resp.get("prompt_eval_count") or 0) + int(resp.get("eval_count") or 0)
     if tokens > 0:
@@ -1102,11 +1116,12 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
             }
         seed_name = (seed.get("function") or {}).get("name", "?")
         log.info("[bg executor] exploratory seed tool: %s", seed_name)
+
         seed_result = _execute_tool_call({
             "function": {"name": seed_name, "arguments": {}}
         })
-        if result is None:
-            result = {"result": None, "note": "tool returned no data"}
+        if seed_result is None:
+            seed_result = {"result": None, "note": "tool returned no data"}
         seed_str = _truncate_tool_result(
             seed_result, BG_EXPLORATORY_SEED_MAX_CHARS
         )

@@ -928,10 +928,11 @@ def chat_stream_generator(
                         last_tool_calls = tc
 
                     if done:
+                        done_reason = chunk.get("done_reason", "?")
                         log.info(
-                            "[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d",
+                            "[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d, done_reason=%s",
                             req_id, round_num, chunk_count,
-                            bool(last_tool_calls), len(remapper.content_acc),
+                            bool(last_tool_calls), len(remapper.content_acc), done_reason,
                         )
                         closing = remapper.close()
                         if closing:
