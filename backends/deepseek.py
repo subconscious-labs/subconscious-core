@@ -228,6 +228,7 @@ class DeepSeekBackend:
         reasoning_acc = ""
         tc_acc: List[Dict] = []
         finish_reason = "stop"
+        usage_acc: Dict[str, Any] = {}
 
         for raw in r.iter_lines():
             if not raw:
@@ -252,6 +253,18 @@ class DeepSeekBackend:
                 content_acc += delta["content"]
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
+            # DeepSeek sends usage in the last chunk before [DONE].
+            if chunk.get("usage"):
+                usage_acc = chunk["usage"]
+
+        log.info("[deepseek chat_sync] finish=%s content=%d reasoning=%d "
+                 "prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s",
+                 finish_reason,
+                 len(content_acc),
+                 len(reasoning_acc),
+                 usage_acc.get("prompt_tokens"),
+                 usage_acc.get("completion_tokens"),
+                 (usage_acc.get("completion_tokens_details") or {}).get("reasoning_tokens"))
 
         result: Dict[str, Any] = {
             "model":       payload["model"],
@@ -259,16 +272,11 @@ class DeepSeekBackend:
             "done":        True,
             "done_reason": finish_reason,
         }
+
         if tc_acc:
             result["message"]["tool_calls"] = _finalise_tc(tc_acc)
         if reasoning_acc:
             result["message"]["reasoning_content"] = reasoning_acc
-
-        log.info("[deepseek chat_sync] finish_reason=%s, content_len=%d, reasoning_len=%d, usage=%s",
-                 result.get("done_reason"),
-                 len(result["message"].get("content") or ""),
-                 len(result["message"].get("reasoning_content") or ""),
-                 (data.get("usage") or {}).get("completion_tokens_details"))
 
         return result
 
