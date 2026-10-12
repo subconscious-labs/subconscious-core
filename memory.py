@@ -22,7 +22,10 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from config import MEMPALACE_PALACE_PATH  # kept for backwards compat / logging
+from config import (
+    MEMPALACE_PALACE_PATH,  # kept for backwards compat / logging
+    MEMORY_KG_SNIPPET_LIMIT,
+)
 
 log = logging.getLogger("chatd.memory")
 
@@ -52,7 +55,7 @@ def _read_identity() -> str:
 
 # ── KG snippet via MCP ────────────────────────────────────────────────────────
 
-def _kg_snippet_via_mcp(limit: int = 60) -> str:
+def _kg_snippet_via_mcp(limit: int = MEMORY_KG_SNIPPET_LIMIT) -> str:
     """Fetch a KG snippet via MCP. Returns "" on any failure."""
     try:
         import mcp_registry

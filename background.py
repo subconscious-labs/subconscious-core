@@ -56,6 +56,10 @@ from config import (
     BG_MAX_ATTEMPTS_PER_GOAL,
     BG_MAX_OPEN_GOALS,
     BG_MAX_TOOL_ROUNDS,
+    BG_TOOL_RESULT_MAX_CHARS,
+    BG_EXPLORATORY_SEED_MAX_CHARS,
+    BG_OBSERVATION_SNIPPET_CHARS,
+    BG_RECENT_OBSERVATIONS_LIMIT,
     BG_EXPLORATORY_PER_DAY,
     BG_EXPLORATORY_TTL_HOURS,
     BG_EXPLORATORY_MIN_INTERVAL_MIN,
@@ -685,25 +689,17 @@ def _allowed_tools_for(kind: str) -> List[Dict[str, Any]]:
     return selected
 
 
-_MAX_TOOL_RESULT_CHARS = 3000
-
-
-def _truncate_tool_result(result: Any) -> str:
-    """Serialize a tool result and cap its size.
-
-    Prefill cost dominates on CPU-only hosts. A 40k-char mempalace_search
-    result can add 15+ minutes to the next LLM call, so we cap aggressively.
-    The model still sees the first few KB - enough to decide the next step
-    or produce a summary.
-    """
+def _truncate_tool_result(result: Any, limit: Optional[int] = None) -> str:
+    if limit is None:
+        limit = BG_TOOL_RESULT_MAX_CHARS
     try:
         serialized = json.dumps(result, ensure_ascii=False)
     except Exception:
         serialized = str(result)
-    if len(serialized) <= _MAX_TOOL_RESULT_CHARS:
+    if limit <= 0 or len(serialized) <= limit:
         return serialized
     return (
-        serialized[:_MAX_TOOL_RESULT_CHARS]
+        serialized[:limit]
         + ' ... [truncated, result was '
         + str(len(serialized))
         + ' chars]'
@@ -789,14 +785,14 @@ def _planner() -> Dict[str, Any]:
     cap = BG_MAX_OPEN_GOALS
 
     # Recent observations for context
-    observations = _read_recent_observations(limit=12)
+    observations = _read_recent_observations(limit=BG_RECENT_OBSERVATIONS_LIMIT)
     obs_lines = []
     for o in observations:
         ts = (o.get("updated_at") or o.get("created_at") or "?")[:16]
         kind = o.get("kind", "?")
         res = (o.get("last_result") or "").replace("\n", " ").strip()
-        if len(res) > 250:
-            res = res[:250] + "..."
+        if len(res) > BG_OBSERVATION_SNIPPET_CHARS:
+            res = res[:BG_OBSERVATION_SNIPPET_CHARS] + "..."
         obs_lines.append(f"- [{ts}] ({kind}) {res}")
     obs_block = "\n".join(obs_lines) if obs_lines else "(no observations yet)"
 
@@ -982,7 +978,7 @@ def _executor_tool_loop(
         for tc in tool_calls:
             result = _execute_tool_call(tc)
             tool_call_count += 1
-            truncated = _truncate_tool_result(result)
+            truncated = _truncate_tool_result(result, BG_TOOL_RESULT_MAX_CHARS)
             log.info("[bg executor] round %d tool result: %d chars (after cap)",
                      round_num, len(truncated))
             messages.append({
@@ -1025,7 +1021,9 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         seed_result = _execute_tool_call({
             "function": {"name": seed_name, "arguments": {}}
         })
-        seed_str = json.dumps(seed_result, ensure_ascii=False)[:4000]
+        seed_str = _truncate_tool_result(
+            seed_result, BG_EXPLORATORY_SEED_MAX_CHARS
+        )
 
         messages: List[Dict[str, Any]] = [
             # Deliberately no full wake-up here - exploratory gets its

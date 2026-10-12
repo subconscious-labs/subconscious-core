@@ -92,6 +92,12 @@ RAG_TOP_K: int = int(_env("RAG_TOP_K", "4"))
 RAG_MAX_CHARS_PER_CHUNK: int = int(_env("RAG_MAX_CHARS_PER_CHUNK", "4000"))
 RAG_MIN_SCORE: float = float(_env("RAG_MIN_SCORE", "0.25"))
 
+# Number of KG triples loaded into the wake-up block (L1). Affects prefill
+# on every chat and every background tick.
+MEMORY_KG_SNIPPET_LIMIT: int = int(
+    _env("MEMORY_KG_SNIPPET_LIMIT", "60")
+)
+
 # ── OpenRouter ────────────────────────────────────────────────────────────────
 OPENROUTER_API_MODELS: List[str] = [
     m.strip()
@@ -252,6 +258,42 @@ BG_JOURNAL_KEEP: int = int(_env("BG_JOURNAL_KEEP", "5"))
 # goal the planner won't touch causes endless introspection loops.
 BG_SKIP_WITH_OPEN_GOALS_STOPS_TICK: bool = (
     _env("BG_SKIP_WITH_OPEN_GOALS_STOPS_TICK", "true").lower() == "true"
+)
+
+# ── Truncation limits ─────────────────────────────────────────────────────
+# Tool results and text snippets are capped before being fed back to the
+# model, to keep prefill bounded on CPU-only hosts. Values are characters,
+# not tokens.
+
+# Max size of a tool result fed back to the background executor.
+# Anything larger gets truncated with a "... [truncated]" marker.
+BG_TOOL_RESULT_MAX_CHARS: int = int(
+    _env("BG_TOOL_RESULT_MAX_CHARS", "3000")
+)
+
+# Max size of the seed tool result in an exploratory tick. Separate from
+# BG_TOOL_RESULT_MAX_CHARS because exploratory does a single LLM call and
+# the seed result is all it sees.
+BG_EXPLORATORY_SEED_MAX_CHARS: int = int(
+    _env("BG_EXPLORATORY_SEED_MAX_CHARS", "4000")
+)
+
+# Max size of one observation entry in the planner's recent-observations
+# block. 12 observations × 250 chars ≈ 3 KB of prefill per planner call.
+BG_OBSERVATION_SNIPPET_CHARS: int = int(
+    _env("BG_OBSERVATION_SNIPPET_CHARS", "250")
+)
+
+# How many recent observations to show the planner.
+BG_RECENT_OBSERVATIONS_LIMIT: int = int(
+    _env("BG_RECENT_OBSERVATIONS_LIMIT", "12")
+)
+
+# Max size of a tool result fed back to the chat model. Looser than the
+# background limit — the user is waiting and full results are more useful.
+# 0 = no cap (not recommended).
+CHAT_TOOL_RESULT_MAX_CHARS: int = int(
+    _env("CHAT_TOOL_RESULT_MAX_CHARS", "8000")
 )
 
 # ── Background prompts (layered override) ────────────────────────────────────

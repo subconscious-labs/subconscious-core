@@ -31,6 +31,7 @@ from config import (
     MEMPALACE_WRITE_TOOLS,
     TOOL_OVERRIDE,
     TOOL_DESCRIPTION_OVERRIDES,
+    CHAT_TOOL_RESULT_MAX_CHARS,
     CHATD_EVENT_TOKEN,
     CHATD_EVENT_MODEL,
     OPENROUTER_API_MODELS,
@@ -362,7 +363,25 @@ def make_ollama_payload(
     return payload
 
 
-# ── tool loop helper ──────────────────────────────────────────────────────────────────
+# ── tool loop helper ──────────────────────────────────────────────────────────
+
+def _truncate_chat_tool_result(result: Any) -> str:
+    """Cap a tool result before feeding it back to the chat model."""
+    if CHAT_TOOL_RESULT_MAX_CHARS <= 0:
+        return json.dumps(result, ensure_ascii=False)
+    try:
+        serialized = json.dumps(result, ensure_ascii=False)
+    except Exception:
+        serialized = str(result)
+    if len(serialized) <= CHAT_TOOL_RESULT_MAX_CHARS:
+        return serialized
+    return (
+        serialized[:CHAT_TOOL_RESULT_MAX_CHARS]
+        + ' ... [truncated, result was '
+        + str(len(serialized))
+        + ' chars]'
+    )
+
 
 def run_tool_loop(
     model: str,
@@ -446,7 +465,7 @@ def run_tool_loop(
                 log.warning("[%s] tool %s error: %s", req_id, name, result["error"])
             messages.append({
                 "role":    "tool",
-                "content": json.dumps(result, ensure_ascii=False),
+                "content": _truncate_chat_tool_result(result),
             })
 
     return ((resp.get("message") or {}).get("content") or "").strip()
@@ -996,7 +1015,7 @@ def chat_stream_generator(
 
                 messages.append({
                     "role":    "tool",
-                    "content": json.dumps(tool_result, ensure_ascii=False),
+                    "content": _truncate_chat_tool_result(tool_result),
                 })
 
             yield _log_yield(req_id, "keepalive/tr", make_keepalive(model))
