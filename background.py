@@ -21,9 +21,9 @@ Hard rules:
   - Two-level timeouts: per phase, and per tick.
 
 Token budget note:
-  Ollama returns prompt_eval_count + eval_count; we use their sum. DeepSeek
-  and OpenRouter currently go through chatd's Ollama-shaped shim and do not
-  expose usage, so their ticks count as 0 tokens. This is a known limitation
+  Ollama returns prompt_eval_count + eval_count; we use their sum.
+  OpenRouter currently go through chatd's Ollama-shaped shim and do not
+  expose usage, so his ticks count as 0 tokens. This is a known limitation
   to be fixed when a real usage channel is plumbed (PR D).
 
 Threading note:
@@ -1059,6 +1059,8 @@ def _executor_tool_loop(
         for tc in tool_calls:
             result = _execute_tool_call(tc)
             tool_call_count += 1
+            if result is None:
+                result = {"result": None, "note": "tool returned no data"}
             truncated = _truncate_tool_result(result, BG_TOOL_RESULT_MAX_CHARS)
             log.info("[bg executor] round %d tool result: %d chars (after cap)",
                      round_num, len(truncated))
@@ -1103,6 +1105,8 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         seed_result = _execute_tool_call({
             "function": {"name": seed_name, "arguments": {}}
         })
+        if result is None:
+            result = {"result": None, "note": "tool returned no data"}
         seed_str = _truncate_tool_result(
             seed_result, BG_EXPLORATORY_SEED_MAX_CHARS
         )
