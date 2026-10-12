@@ -212,41 +212,57 @@ class DeepSeekBackend:
         }
 
     def chat_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        body = _to_openai(payload, stream=False)
+        """DeepSeek Flash truncates reasoning in non-streaming mode when
+        thinking runs long, leaving content empty. Streaming does not have
+        this limit. We always stream and accumulate the result."""
+        body = _to_openai(payload, stream=True)
         r = _session.post(
             f"{DEEPSEEK_API}/chat/completions",
-            headers=self._headers(), json=body, timeout=600,
+            headers=self._headers(), json=body, timeout=600, stream=True,
         )
         if not r.ok:
             log.error("[deepseek] HTTP %s body: %s", r.status_code, r.text[:1000])
         r.raise_for_status()
-        data = r.json()
-        choice = (data.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
+
+        content_acc = ""
+        reasoning_acc = ""
+        tc_acc: List[Dict] = []
+        finish_reason = "stop"
+
+        for raw in r.iter_lines():
+            if not raw:
+                continue
+            line = raw.decode("utf-8").removeprefix("data: ")
+            if line.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+
+            if delta.get("reasoning_content"):
+                reasoning_acc += delta["reasoning_content"]
+            if delta.get("tool_calls"):
+                _merge_tc(tc_acc, delta["tool_calls"])
+                continue
+            if delta.get("content"):
+                content_acc += delta["content"]
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
 
         result: Dict[str, Any] = {
-            "model":   payload["model"],
-            "message": {"role": "assistant", "content": msg.get("content") or ""},
-            "done":    True,
-            "done_reason": "stop",
+            "model":       payload["model"],
+            "message":     {"role": "assistant", "content": content_acc},
+            "done":        True,
+            "done_reason": finish_reason,
         }
-        if msg.get("tool_calls"):
-            tcs = []
-            for tc in msg["tool_calls"]:
-                fn = tc.get("function") or {}
-                args = fn.get("arguments") or "{}"
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {}
-                tcs.append({
-                    "id": tc.get("id") or _make_tc_id(),
-                    "function": {"name": fn.get("name", ""), "arguments": args},
-                })
-            result["message"]["tool_calls"] = tcs
-        if msg.get("reasoning_content"):
-            result["message"]["reasoning_content"] = msg["reasoning_content"]
+        if tc_acc:
+            result["message"]["tool_calls"] = _finalise_tc(tc_acc)
+        if reasoning_acc:
+            result["message"]["reasoning_content"] = reasoning_acc
         return result
 
     def chat_stream(self, payload: Dict[str, Any]) -> Generator[bytes, None, None]:
