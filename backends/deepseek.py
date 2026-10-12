@@ -271,6 +271,8 @@ class DeepSeekBackend:
             "message":     {"role": "assistant", "content": content_acc},
             "done":        True,
             "done_reason": finish_reason,
+            "prompt_eval_count": int(usage_acc.get("prompt_tokens") or 0),
+            "eval_count":        int(usage_acc.get("completion_tokens") or 0),
         }
 
         if tc_acc:
