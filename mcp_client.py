@@ -27,7 +27,7 @@ except ImportError:
     create_mcp_http_client = None
     _HTTP_NEW_API = False
 
-from config import MCP_ENV_PREFIX
+from config import MCP_ENV_PREFIXES
 
 log = logging.getLogger("chatd.mcp_client")
 
@@ -55,11 +55,11 @@ def discover_mcp_servers() -> dict[str, dict]:
     servers: dict[str, dict] = {}
 
     for key, raw in os.environ.items():
-        if not key.startswith(MCP_ENV_PREFIX):
+        prefix = next((p for p in MCP_ENV_PREFIXES if key.startswith(p)), None)
+        if prefix is None:
             continue
         val = (raw or "").strip()
-        rest = key[len(MCP_ENV_PREFIX):]
-
+        rest = key[len(prefix):]
         if rest.startswith("STDIO_"):
             name = rest[len("STDIO_"):].lower()
             if not name or not val:
