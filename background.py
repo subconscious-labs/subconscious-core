@@ -835,14 +835,30 @@ def _planner() -> Dict[str, Any]:
     ]
 
     resp = _llm_call(messages, model, tools=None,
-                     num_predict=BG_NUM_PREDICT,
-                     response_format="json")
+                     num_predict=BG_NUM_PREDICT)
     _raw_msg = resp["raw"].get("message") or {}
     _c = resp["content"] or ""
     _r = _raw_msg.get("reasoning_content") or ""
     log.info("[bg planner] content(%d)=%r", len(_c), _c[:400])
     log.info("[bg planner] reasoning(%d)=%r", len(_r), _r[:400])
-    decision = _extract_json(resp["content"]) or {}
+
+    if not _c.strip():
+        _append_journal({
+            "ts": _now_iso(),
+            "phase": "planner",
+            "diagnostic": "empty_content",
+            "content_len": 0,
+            "reasoning_len": len(_r),
+            "reasoning": _r[:2000],
+        })
+
+    text_for_parse = resp["content"] or ""
+    if not text_for_parse.strip():
+        _r = (resp["raw"].get("message") or {}).get("reasoning_content") or ""
+        if _r.strip():
+            log.info("[bg planner] content empty, falling back to reasoning")
+            text_for_parse = _r
+    decision = _extract_json(text_for_parse) or {}
 
     d = decision.get("decision")
 
@@ -1054,8 +1070,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         tokens_total = 0
         try:
             resp = _llm_call(messages, model, tools=None,
-                             num_predict=BG_NUM_PREDICT,
-                             response_format="json")
+                             num_predict=BG_NUM_PREDICT)
             tokens_total = resp["tokens"]
             parsed = _extract_json(resp["content"]) or {}
         except Exception as e:
@@ -1199,7 +1214,13 @@ def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
         return {"decision": "keep_blocked", "reason": f"reflector error: {e}",
                 "model": model, "tokens": 0}
 
-    parsed = _extract_json(resp["content"]) or {}
+    text_for_parse = resp["content"] or ""
+    if not text_for_parse.strip():
+        _r = (resp["raw"].get("message") or {}).get("reasoning_content") or ""
+        if _r.strip():
+            log.info("[bg reflector] content empty, falling back to reasoning")
+            text_for_parse = _r
+    parsed = _extract_json(text_for_parse) or {}
     d = parsed.get("decision")
     if d not in ("retry", "cancel", "keep_blocked"):
         d = "keep_blocked"
