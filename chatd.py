@@ -823,21 +823,23 @@ def tags():
     if not r.ok:
         return jsonify(data), r.status_code
 
-    ollama_entries = data.setdefault("models", [])
+    ollama_entries = list(data.get("models") or [])
     or_entries = _build_or_tags()
     deepseek_entries = _build_deepseek_tags()
 
-    data.setdefault("models", [])
-    data["models"].extend(ollama_entries)
-    data["models"].extend(or_entries)
-    data["models"].extend(deepseek_entries)
+    merged, seen = [], set()
+    for entry in ollama_entries + or_entries + deepseek_entries:
+        key = entry.get("model") or entry.get("name")
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(entry)
+    data["models"] = merged
 
     log.info(
         "[tags] ollama=%d or=%d deepseek=%d total=%d",
-        len(ollama_entries),
-        len(or_entries),
-        len(deepseek_entries),
-        len(data["models"]))
+        len(ollama_entries), len(or_entries), len(deepseek_entries), len(merged),
+    )
     return jsonify(data)
 
 
