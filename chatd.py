@@ -300,8 +300,12 @@ def build_model_messages(
                 entry["reasoning_content"] = m["reasoning_content"]
         turns.append(entry)
 
-    if len(turns) > max_history_turns * 2:
-        turns = turns[-(max_history_turns * 2):]
+    user_idx = [i for i, t in enumerate(turns) if t["role"] == "user"]
+    if len(user_idx) > max_history_turns:
+        turns = turns[user_idx[-max_history_turns]:]
+
+    while turns and turns[0]["role"] == "tool":
+        turns.pop(0)
 
     result = []
     if system:
