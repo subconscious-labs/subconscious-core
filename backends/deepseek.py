@@ -1,9 +1,27 @@
+"""backends/deepseek.py - DeepSeek inference backend.
+
+Wire format: OpenAI-compatible /chat/completions over HTTPS (SSE).
+Embed: not supported.
+
+Internal chunk shape (see backends.base docstring):
+  {"model", "message": {"role", "content", "thinking"?,
+   "tool_calls"?}, "done", "done_reason"?, "usage"?}
+
+Mapping:
+  DeepSeek streaming delta.reasoning_content  →  message.thinking
+  DeepSeek non-stream usage                   →  chunk.usage
+  DeepSeek finish_reason                      →  chunk.done_reason
+  Internal flat tool_calls                    ↔  OpenAI nested tool_calls
+"""
+from __future__ import annotations
+
 import json
 import logging
 import os
-import requests
 import uuid
 from typing import Any, Dict, Generator, List
+
+import requests
 
 from config import DEEPSEEK_API
 
@@ -23,8 +41,15 @@ def _make_tc_id() -> str:
     return "call_" + uuid.uuid4().hex[:16]
 
 
+# ── outgoing: internal flat → OpenAI nested ──────────────────────────────────
+
 def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
-    """Convert Ollama-format payload to OpenAI wire format with proper tool ids."""
+    """Convert internal payload to OpenAI wire format.
+
+    Input assistant messages carry FLAT tool_calls:
+      {"id": "...", "name": "foo", "arguments": {...}}
+    Input assistant messages carry `thinking` (not `reasoning_content`).
+    """
     raw_messages: List[Dict] = payload.get("messages", [])
     converted: List[Dict] = []
     pending_tc_ids: List[str] = []
@@ -40,8 +65,8 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
                 pending_tc_ids = []
                 pending_tc_index = 0
                 for tc in tcs:
-                    fn = tc.get("function") or {}
-                    args = fn.get("arguments") or {}
+                    name = tc.get("name", "")
+                    args = tc.get("arguments") or {}
                     if isinstance(args, dict):
                         args = json.dumps(args, ensure_ascii=False)
                     tc_id = tc.get("id") or _make_tc_id()
@@ -49,26 +74,22 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
                     openai_tcs.append({
                         "id":   tc_id,
                         "type": "function",
-                        "function": {
-                            "name":      fn.get("name", ""),
-                            "arguments": args,
-                        },
+                        "function": {"name": name, "arguments": args},
                     })
                 entry: Dict[str, Any] = {
                     "role":       "assistant",
                     "content":    m.get("content") or "",
                     "tool_calls": openai_tcs,
                 }
-                if m.get("reasoning_content"):
-                    entry["reasoning_content"] = m["reasoning_content"]
+                if m.get("thinking"):
+                    entry["reasoning_content"] = m["thinking"]
                 converted.append(entry)
             else:
-                # No tool_calls - DO NOT emit the key at all (empty [] is rejected)
                 pending_tc_ids = []
                 pending_tc_index = 0
                 entry = {"role": "assistant", "content": m.get("content") or ""}
-                if m.get("reasoning_content"):
-                    entry["reasoning_content"] = m["reasoning_content"]
+                if m.get("thinking"):
+                    entry["reasoning_content"] = m["thinking"]
                 converted.append(entry)
 
         elif role == "tool":
@@ -93,9 +114,6 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
         "stream":   stream,
     }
 
-    # Force JSON output for planner/reflector-like calls where the caller
-    # expects a strict JSON object. DeepSeek Flash always emits reasoning
-    # and may otherwise wrap its JSON in prose.
     options = payload.get("options") or {}
     if options.get("response_format") == "json":
         body["response_format"] = {"type": "json_object"}
@@ -104,7 +122,6 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
         body["tools"] = payload["tools"]
         body["tool_choice"] = "auto"
 
-    options = payload.get("options") or {}
     for src, dst in (("temperature", "temperature"),
                      ("top_p", "top_p"),
                      ("num_predict", "max_tokens")):
@@ -113,6 +130,8 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
 
     return body
 
+
+# ── streaming tool-call accumulator ──────────────────────────────────────────
 
 def _merge_tc(acc: List[Dict], deltas: List[Dict]) -> List[Dict]:
     for delta in deltas:
@@ -132,7 +151,8 @@ def _merge_tc(acc: List[Dict], deltas: List[Dict]) -> List[Dict]:
 
 
 def _finalise_tc(acc: List[Dict]) -> List[Dict]:
-    result = []
+    """Accumulated OpenAI-style → flat internal shape."""
+    result: List[Dict] = []
     for entry in acc:
         fn = entry.get("function") or {}
         args_str = fn.get("arguments") or "{}"
@@ -141,16 +161,18 @@ def _finalise_tc(acc: List[Dict]) -> List[Dict]:
         except json.JSONDecodeError:
             args = {}
         result.append({
-            "id":       entry.get("id") or _make_tc_id(),
-            "function": {"name": fn.get("name", ""), "arguments": args},
+            "id":        entry.get("id") or _make_tc_id(),
+            "name":      fn.get("name", ""),
+            "arguments": args,
         })
     return result
 
 
+# ── stream: SSE → normalized NDJSON ──────────────────────────────────────────
+
 def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
-    """DeepSeek SSE (OpenAI delta) → Ollama NDJSON chunks."""
+    """DeepSeek SSE (OpenAI delta) → normalized internal NDJSON chunks."""
     tc_acc: List[Dict] = []
-    reasoning_acc: str = ""
 
     for raw in response.iter_lines():
         if not raw:
@@ -165,8 +187,7 @@ def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
             }
             if tc_acc:
                 out["message"]["tool_calls"] = _finalise_tc(tc_acc)
-            if reasoning_acc:
-                out["message"]["reasoning_content"] = reasoning_acc
+                out["done_reason"] = "tool_calls"
             yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
             return
 
@@ -179,15 +200,25 @@ def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
         delta  = choice.get("delta") or {}
         finish = choice.get("finish_reason")
 
+        # reasoning delta → отдельный чанк с message.thinking
         if delta.get("reasoning_content"):
-            reasoning_acc += delta["reasoning_content"]
+            out = {
+                "model": model,
+                "message": {
+                    "role":     "assistant",
+                    "content":  "",
+                    "thinking": delta["reasoning_content"],
+                },
+                "done": False,
+            }
+            yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
 
         if delta.get("tool_calls"):
             _merge_tc(tc_acc, delta["tool_calls"])
             continue
 
         content = delta.get("content") or ""
-        if not content and not finish and not delta.get("tool_calls"):
+        if not content and not finish:
             continue
 
         out = {
@@ -199,10 +230,10 @@ def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
             out["done_reason"] = finish
             if tc_acc:
                 out["message"]["tool_calls"] = _finalise_tc(tc_acc)
-            if reasoning_acc:
-                out["message"]["reasoning_content"] = reasoning_acc
         yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
 
+
+# ── backend ──────────────────────────────────────────────────────────────────
 
 class DeepSeekBackend:
     def _headers(self) -> Dict[str, str]:
@@ -214,9 +245,9 @@ class DeepSeekBackend:
         }
 
     def chat_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """DeepSeek Flash truncates reasoning in non-streaming mode when
-        thinking runs long, leaving content empty. Streaming does not have
-        this limit. We always stream and accumulate the result."""
+        """DeepSeek truncates reasoning in non-streaming mode when thinking
+        runs long, leaving content empty. Streaming does not have this limit.
+        We always stream and accumulate the result."""
         body = _to_openai(payload, stream=True)
         r = _session.post(
             f"{DEEPSEEK_API}/chat/completions",
@@ -244,7 +275,7 @@ class DeepSeekBackend:
                 continue
 
             choice = (chunk.get("choices") or [{}])[0]
-            delta = choice.get("delta") or {}
+            delta  = choice.get("delta") or {}
 
             if delta.get("reasoning_content"):
                 reasoning_acc += delta["reasoning_content"]
@@ -255,32 +286,46 @@ class DeepSeekBackend:
                 content_acc += delta["content"]
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
-            # DeepSeek sends usage in the last chunk before [DONE].
             if chunk.get("usage"):
                 usage_acc = chunk["usage"]
 
-        log.info("[deepseek chat_sync] finish=%s content=%d reasoning=%d "
-                 "prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s",
-                 finish_reason,
-                 len(content_acc),
-                 len(reasoning_acc),
-                 usage_acc.get("prompt_tokens"),
-                 usage_acc.get("completion_tokens"),
-                 (usage_acc.get("completion_tokens_details") or {}).get("reasoning_tokens"))
+        log.info(
+            "[deepseek chat_sync] finish=%s content=%d reasoning=%d "
+            "prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s "
+            "cache_hit=%s cache_miss=%s",
+            finish_reason,
+            len(content_acc),
+            len(reasoning_acc),
+            usage_acc.get("prompt_tokens"),
+            usage_acc.get("completion_tokens"),
+            (usage_acc.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+            usage_acc.get("prompt_cache_hit_tokens"),
+            usage_acc.get("prompt_cache_miss_tokens"),
+        )
 
         result: Dict[str, Any] = {
             "model":       payload["model"],
             "message":     {"role": "assistant", "content": content_acc},
             "done":        True,
             "done_reason": finish_reason,
-            "prompt_eval_count": int(usage_acc.get("prompt_tokens") or 0),
-            "eval_count":        int(usage_acc.get("completion_tokens") or 0),
         }
-
         if tc_acc:
             result["message"]["tool_calls"] = _finalise_tc(tc_acc)
+            if finish_reason == "stop":
+                result["done_reason"] = "tool_calls"
         if reasoning_acc:
-            result["message"]["reasoning_content"] = reasoning_acc
+            result["message"]["thinking"] = reasoning_acc
+        if usage_acc:
+            result["usage"] = {
+                "prompt_tokens":     int(usage_acc.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage_acc.get("completion_tokens") or 0),
+                "reasoning_tokens":  int(
+                    (usage_acc.get("completion_tokens_details") or {})
+                    .get("reasoning_tokens") or 0
+                ),
+                "cache_hit_tokens":  int(usage_acc.get("prompt_cache_hit_tokens") or 0),
+                "cache_miss_tokens": int(usage_acc.get("prompt_cache_miss_tokens") or 0),
+            }
 
         return result
 
@@ -291,7 +336,6 @@ class DeepSeekBackend:
             headers=self._headers(), json=body, timeout=600, stream=True,
         )
         if not r.ok:
-            # Log the body - this is where your 400 detail lives
             log.error("[deepseek] HTTP %s body: %s", r.status_code, r.text[:2000])
         r.raise_for_status()
         yield from _sse_to_ndjson(r, payload["model"])

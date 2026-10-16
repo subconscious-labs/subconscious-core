@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """background.py - background thinking (subconscious) for chatd.
 
 Phases (one per tick):
@@ -654,7 +653,7 @@ def _llm_call(
     num_predict: Optional[int] = None,
     response_format: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Single backend call. Returns {content, tool_calls, tokens, raw}."""
+    """Single backend call. Returns {content, thinking, tool_calls, tokens, raw}."""
     import backends
     from config import DEFAULT_OPTIONS, THINKING
 
@@ -669,7 +668,6 @@ def _llm_call(
         "stream": False,
         "options": options,
     }
-
     if tools:
         body["tools"] = tools
     if not THINKING:
@@ -678,28 +676,34 @@ def _llm_call(
     backend = backends.get_backend(model)
     resp = backend.chat_sync(body)
 
-    _msg = resp.get("message") or {}
+    msg = resp.get("message") or {}
+    usage = resp.get("usage") or {}
+    thinking = msg.get("thinking") or ""
+
     log.info(
-        "[bg llm] model=%s finish=%s content=%d reasoning=%d "
-        "tool_calls=%d prompt_tokens=%s eval_tokens=%s",
+        "[bg llm] model=%s finish=%s content=%d thinking=%d tool_calls=%d "
+        "prompt_tokens=%s completion_tokens=%s",
         model,
-        resp.get("done_reason") or resp.get("finish_reason") or "?",
-        len(_msg.get("content") or ""),
-        len(_msg.get("reasoning_content") or ""),
-        len(_msg.get("tool_calls") or []),
-        resp.get("prompt_eval_count"),
-        resp.get("eval_count"),
+        resp.get("done_reason", "?"),
+        len(msg.get("content") or ""),
+        len(thinking),
+        len(msg.get("tool_calls") or []),
+        usage.get("prompt_tokens", 0),
+        usage.get("completion_tokens", 0),
     )
 
-    msg = resp.get("message") or {}
-    tokens = int(resp.get("prompt_eval_count") or 0) + int(resp.get("eval_count") or 0)
+    tokens = (
+        int(usage.get("prompt_tokens") or 0)
+        + int(usage.get("completion_tokens") or 0)
+    )
     if tokens > 0:
         _budget_add_llm(tokens, _is_cloud(model))
     return {
-        "content": msg.get("content") or "",
+        "content":    msg.get("content") or "",
+        "thinking":   thinking,
         "tool_calls": msg.get("tool_calls") or [],
-        "tokens": tokens,
-        "raw": resp,
+        "tokens":     tokens,
+        "raw":        resp,
     }
 
 
@@ -903,11 +907,10 @@ def _planner() -> Dict[str, Any]:
 
     resp = _llm_call(messages, model, tools=None,
                      num_predict=BG_NUM_PREDICT)
-    _raw_msg = resp["raw"].get("message") or {}
     _c = resp["content"] or ""
-    _r = _raw_msg.get("reasoning_content") or ""
+    _r = resp.get("thinking") or ""
     log.info("[bg planner] content(%d)=%r", len(_c), _c[:400])
-    log.info("[bg planner] reasoning(%d)=%r", len(_r), _r[:400])
+    log.info("[bg planner] thinking(%d)=%r", len(_r), _r[:400])
 
     if not _c.strip():
         _append_journal({
@@ -915,16 +918,14 @@ def _planner() -> Dict[str, Any]:
             "phase": "planner",
             "diagnostic": "empty_content",
             "content_len": 0,
-            "reasoning_len": len(_r),
-            "reasoning": _r[:2000],
+            "thinking_len": len(_r),
+            "thinking": _r[:2000],
         })
 
     text_for_parse = resp["content"] or ""
-    if not text_for_parse.strip():
-        _r = (resp["raw"].get("message") or {}).get("reasoning_content") or ""
-        if _r.strip():
-            log.info("[bg planner] content empty, falling back to reasoning")
-            text_for_parse = _r
+    if not text_for_parse.strip() and _r.strip():
+        log.info("[bg planner] content empty, falling back to thinking")
+        text_for_parse = _r
     decision = _extract_json(text_for_parse) or {}
 
     d = decision.get("decision")
@@ -1061,13 +1062,12 @@ def _executor_tool_loop(
             break
 
         assistant_msg: Dict[str, Any] = {
-            "role": "assistant",
-            "content": resp["content"],
+            "role":       "assistant",
+            "content":    resp["content"],
             "tool_calls": tool_calls,
         }
-        if resp["raw"].get("message", {}).get("reasoning_content"):
-            assistant_msg["reasoning_content"] = \
-                resp["raw"]["message"]["reasoning_content"]
+        if resp.get("thinking"):
+            assistant_msg["thinking"] = resp["thinking"]
         messages.append(assistant_msg)
 
         for tc in tool_calls:
@@ -1079,7 +1079,7 @@ def _executor_tool_loop(
             log.info("[bg executor] round %d tool result: %d chars (after cap)",
                      round_num, len(truncated))
             messages.append({
-                "role": "tool",
+                "role":    "tool",
                 "content": truncated,
             })
         log.info("[bg executor] round %d: %d tool call(s)",
@@ -1116,7 +1116,6 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
             }
         seed_name = (seed.get("function") or {}).get("name", "?")
         log.info("[bg executor] exploratory seed tool: %s", seed_name)
-
         seed_result = _execute_tool_call({
             "function": {"name": seed_name, "arguments": {}}
         })
@@ -1127,11 +1126,6 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         messages: List[Dict[str, Any]] = [
-            # Deliberately no full wake-up here - exploratory gets its
-            # context from the seed tool result, not from the static KG
-            # block. This cuts prefill from ~3500 chars to ~200 and forces
-            # the model to look at fresh data instead of recalled facts.
-            # {"role": "system", "content": _system_block()},
             {"role": "system", "content": _EXPLORATORY_INSTRUCTIONS},
             {"role": "user", "content":
                 f"I ran the read-only tool {seed_name} with empty arguments.\n"
@@ -1169,8 +1163,6 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
                     if t:
                         new_goals.append(t[:300])
 
-        # Derive a readable title from the observation so goals.json isn't
-        # full of "(exploratory tick)" entries.
         title = (observation[:80].rstrip() or "(exploratory tick)") \
             if observation else "(exploratory tick)"
 
@@ -1184,7 +1176,6 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
             "useful": useful,
             "degraded": degrade_reason,
         }
-
 
     # ── Normal goal: tool loop + summary ────────────────────────────────
     user_text = (
@@ -1293,9 +1284,9 @@ def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
 
     text_for_parse = resp["content"] or ""
     if not text_for_parse.strip():
-        _r = (resp["raw"].get("message") or {}).get("reasoning_content") or ""
+        _r = resp.get("thinking") or ""
         if _r.strip():
-            log.info("[bg reflector] content empty, falling back to reasoning")
+            log.info("[bg reflector] content empty, falling back to thinking")
             text_for_parse = _r
     parsed = _extract_json(text_for_parse) or {}
     d = parsed.get("decision")

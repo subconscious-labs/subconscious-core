@@ -1,24 +1,40 @@
 """backends/base.py - Backend Protocol (structural interface).
 
-Every backend must satisfy this Protocol. No inheritance required -
-duck typing is sufficient, but explicit registration is encouraged.
-
 Chat contract:
   chat_stream(payload) -> Iterator[bytes]
-    Yields Ollama-format NDJSON lines (bytes).
-    Each line: {"model":..., "message":{"role":"assistant","content":...}, "done":bool}
+    Yields normalized NDJSON chunks (see below) as UTF-8 bytes.
 
   chat_sync(payload) -> dict
-    Returns a single Ollama-format response dict.
+    Returns a single normalized response dict.
 
-Embed contract:
   embed(text, model) -> list[float]
-    Returns a normalised float vector of fixed dimensionality.
-    model - the embedding model identifier to use.
-    Raises RuntimeError if the backend does not support embeddings.
+
+Normalized chunk shape (all backends MUST emit this):
+  {
+    "model": str,
+    "created_at": str,               # optional
+    "message": {
+      "role": "assistant",
+      "content": str,                # text delta / full text
+      "thinking": str,               # optional; reasoning delta / full
+      "tool_calls": [                # optional; only when complete
+        {"id": str, "name": str, "arguments": dict}
+      ],
+    },
+    "done": bool,
+    "done_reason": str,              # on done: stop|length|tool_calls|error
+    "usage": {                       # on done, if provider reports it
+      "prompt_tokens": int, "completion_tokens": int,
+      "reasoning_tokens": int,
+      "cache_hit_tokens": int, "cache_miss_tokens": int,
+    },
+  }
 
 payload is always an Ollama-format dict:
   {"model": str, "messages": [...], "options": {...}, "tools": [...], "stream": bool}
+
+Incoming messages may carry `thinking` on assistant turns — backends map
+it to whatever their provider expects (e.g. DeepSeek uses `reasoning_content`).
 """
 from __future__ import annotations
 

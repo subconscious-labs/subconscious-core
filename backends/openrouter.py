@@ -103,21 +103,20 @@ def _make_tc_id() -> str:
 def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
     """Convert Ollama-format payload to OpenAI wire format.
 
-    Key invariant: every assistant message that has tool_calls must have an
-    `id` on each call, and the immediately following tool messages must echo
-    those ids as `tool_call_id`.  We do a single pass over messages, assigning
-    ids as we go so that assistant and tool messages stay in sync.
+    Accepts FLAT tool_calls on input:  {"id": ..., "name": ..., "arguments": {...}}
+    Emits NESTED tool_calls to OpenAI: {"id": ..., "type": "function",
+                                        "function": {"name": ..., "arguments": "..."}}
+
+    Key invariant: every assistant message with tool_calls has an id, and
+    the following tool messages echo those ids as tool_call_id.
     """
     model = payload["model"]
     opts = payload.get("options", {})
 
-    # ── convert messages ──────────────────────────────────────────────────────
     raw_messages: List[Dict] = payload.get("messages", [])
     converted: List[Dict] = []
-    # Maps positional index in last assistant tool_calls → id, so the next
-    # batch of tool messages can pick up the right tool_call_id.
     pending_tc_ids: List[str] = []
-    pending_tc_index: int = 0   # which id to assign to the next tool message
+    pending_tc_index: int = 0
 
     for m in raw_messages:
         role = m.get("role")
@@ -125,13 +124,13 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
         if role == "assistant":
             tcs = m.get("tool_calls") or []
             if tcs:
-                # Build OpenAI-format tool_calls with ids.
                 openai_tcs = []
                 pending_tc_ids = []
                 pending_tc_index = 0
                 for tc in tcs:
-                    fn = tc.get("function") or {}
-                    args = fn.get("arguments") or {}
+                    # FLAT shape on input
+                    name = tc.get("name", "")
+                    args = tc.get("arguments") or {}
                     if isinstance(args, dict):
                         args = json.dumps(args, ensure_ascii=False)
                     tc_id = tc.get("id") or _make_tc_id()
@@ -139,28 +138,29 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
                     openai_tcs.append({
                         "id":       tc_id,
                         "type":     "function",
-                        "function": {
-                            "name":      fn.get("name", ""),
-                            "arguments": args,
-                        },
+                        "function": {"name": name, "arguments": args},
                     })
-                converted.append({
+                entry: Dict[str, Any] = {
                     "role":       "assistant",
                     "content":    m.get("content") or "",
                     "tool_calls": openai_tcs,
-                })
+                }
+                if m.get("thinking"):
+                    entry["reasoning_content"] = m["thinking"]
+                converted.append(entry)
             else:
                 pending_tc_ids = []
                 pending_tc_index = 0
-                converted.append({"role": "assistant", "content": m.get("content") or ""})
+                entry = {"role": "assistant", "content": m.get("content") or ""}
+                if m.get("thinking"):
+                    entry["reasoning_content"] = m["thinking"]
+                converted.append(entry)
 
         elif role == "tool":
-            # Pair each tool result with the id from the preceding assistant turn.
             if pending_tc_index < len(pending_tc_ids):
                 tc_id = pending_tc_ids[pending_tc_index]
                 pending_tc_index += 1
             else:
-                # Fallback: generate a fresh id (shouldn't happen in normal flow).
                 tc_id = _make_tc_id()
                 log.warning("[openrouter] tool message without matching assistant tool_call_id")
             converted.append({
@@ -219,7 +219,10 @@ def _merge_tool_call_deltas(acc: List[Dict], deltas: List[Dict]) -> List[Dict]:
 
 
 def _finalise_tool_calls(acc: List[Dict]) -> List[Dict]:
-    """Parse accumulated argument strings; preserve id for tool_call_id matching."""
+    """Parse accumulated argument strings; emit FLAT tool_calls.
+
+    Returns: [{"id": "call_...", "name": "foo", "arguments": {...}}]
+    """
     result = []
     for entry in acc:
         fn = entry.get("function") or {}
@@ -230,8 +233,9 @@ def _finalise_tool_calls(acc: List[Dict]) -> List[Dict]:
             log.warning("[openrouter] failed to parse tool_call arguments: %r", args_str[:200])
             args = {}
         result.append({
-            "id":       entry.get("id") or _make_tc_id(),
-            "function": {"name": fn.get("name", ""), "arguments": args},
+            "id":        entry.get("id") or _make_tc_id(),
+            "name":      fn.get("name", ""),
+            "arguments": args,
         })
     return result
 
@@ -294,16 +298,14 @@ def _error_chunk(model: str, detail: str, status: int) -> bytes:
 def _sse_to_ndjson(
     response: requests.Response, model: str
 ) -> Generator[bytes, None, None]:
-    """Convert OpenAI SSE stream to Ollama NDJSON bytes.
+    """Convert OpenAI SSE stream to normalized internal chunks.
 
-    Tool call handling:
-      OpenAI streams tool_calls as delta fragments.  We accumulate all
-      fragments in `_tc_acc` and emit them only once in the final done=True
-      chunk.  The assembled entries preserve the `id` field so that
-      _to_openai() can correctly pair subsequent tool messages.
+    Emits:
+      - thinking deltas as message.thinking
+      - text deltas as message.content
+      - tool_calls (flat) on the final done chunk
     """
     _tc_acc: List[Dict] = []
-    content_acc: str = ""
 
     for raw in response.iter_lines():
         if not raw:
@@ -319,10 +321,11 @@ def _sse_to_ndjson(
             if _tc_acc:
                 finalised = _finalise_tool_calls(_tc_acc)
                 out["message"]["tool_calls"] = finalised
+                out["done_reason"] = "tool_calls"
                 log.debug(
                     "[openrouter] assembled %d tool_call(s) at [DONE]: %s",
                     len(finalised),
-                    [tc["function"]["name"] for tc in finalised],
+                    [tc["name"] for tc in finalised],
                 )
             yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
             return
@@ -336,13 +339,26 @@ def _sse_to_ndjson(
         delta  = choice.get("delta") or {}
         finish = choice.get("finish_reason")
 
+        # thinking delta → отдельный нормализованный чанк
+        if delta.get("reasoning_content"):
+            out = {
+                "model": model,
+                "message": {
+                    "role":     "assistant",
+                    "content":  "",
+                    "thinking": delta["reasoning_content"],
+                },
+                "done": False,
+            }
+            yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
+
         if delta.get("tool_calls"):
             _merge_tool_call_deltas(_tc_acc, delta["tool_calls"])
             continue
 
         content = delta.get("content") or ""
-        if content:
-            content_acc += content
+        if not content and not finish:
+            continue
 
         out = {
             "model":   model,
@@ -357,7 +373,7 @@ def _sse_to_ndjson(
                 log.debug(
                     "[openrouter] assembled %d tool_call(s) at finish: %s",
                     len(finalised),
-                    [tc["function"]["name"] for tc in finalised],
+                    [tc["name"] for tc in finalised],
                 )
         yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
 
@@ -397,16 +413,21 @@ class OpenRouterBackend:
             detail = _log_http_error(exc)
             status = exc.response.status_code if exc.response is not None else 0
             raise RuntimeError(f"OpenRouter HTTP {status}: {detail}") from exc
+
         data   = r.json()
         choice = (data.get("choices") or [{}])[0]
         msg    = choice.get("message") or {}
+        usage  = data.get("usage") or {}
+
         result: Dict[str, Any] = {
             "model":   payload["model"],
             "message": {"role": "assistant", "content": msg.get("content") or ""},
-            "done":    True, "done_reason": "stop",
+            "done":    True,
+            "done_reason": choice.get("finish_reason") or "stop",
         }
+        if msg.get("reasoning_content"):
+            result["message"]["thinking"] = msg["reasoning_content"]
         if msg.get("tool_calls"):
-            # Sync path: normalise preserving id.
             tcs = []
             for tc in msg["tool_calls"]:
                 fn   = tc.get("function") or {}
@@ -417,10 +438,23 @@ class OpenRouterBackend:
                     except json.JSONDecodeError:
                         args = {}
                 tcs.append({
-                    "id":       tc.get("id") or _make_tc_id(),
-                    "function": {"name": fn.get("name", ""), "arguments": args},
+                    "id":        tc.get("id") or _make_tc_id(),
+                    "name":      fn.get("name", ""),
+                    "arguments": args,
                 })
             result["message"]["tool_calls"] = tcs
+            if result["done_reason"] == "stop":
+                result["done_reason"] = "tool_calls"
+        if usage:
+            result["usage"] = {
+                "prompt_tokens":     int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+                "reasoning_tokens":  int(
+                    (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+                ),
+                "cache_hit_tokens":  int(usage.get("prompt_cache_hit_tokens") or 0),
+                "cache_miss_tokens": int(usage.get("prompt_cache_miss_tokens") or 0),
+            }
         return result
 
     def embed(self, text: str, model: str) -> List[float]:

@@ -43,7 +43,7 @@ from config import (
 from backends.ollama import OLLAMA_API
 from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
 from mcp_client import MCPClient, discover_mcp_servers
-from think_remapper import ThinkingRemapper
+
 
 # ── logging ────────────────────────────────────────────────────────────────────
 
@@ -130,6 +130,39 @@ def make_chunk(model: str, content: str, done: bool = False) -> bytes:
 
 def make_keepalive(model: str) -> bytes:
     return make_chunk(model, "")
+
+
+def make_event_chunk(
+    model: str,
+    event_type: str,
+    payload: Dict[str, Any],
+) -> bytes:
+    """Typed event chunk. Clients MUST NOT append to message history."""
+    obj: Dict[str, Any] = {
+        "model":      model,
+        "created_at": now_iso(),
+        "message":    {"role": "assistant", "content": ""},
+        "event":      {"type": event_type, **payload},
+        "done":       False,
+    }
+    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def make_done_chunk(
+    model: str,
+    done_reason: str = "stop",
+    usage: Optional[Dict[str, Any]] = None,
+) -> bytes:
+    obj: Dict[str, Any] = {
+        "model":       model,
+        "created_at":  now_iso(),
+        "message":     {"role": "assistant", "content": ""},
+        "done":        True,
+        "done_reason": done_reason,
+    }
+    if usage:
+        obj["usage"] = usage
+    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
@@ -271,11 +304,11 @@ def build_model_messages(
     """Sanitise messages for the backend.
 
     - Strip fields unknown to Ollama (chatId, id, createdAt, updatedAt …).
-    - Remove <think>…</think> blocks from previous assistant turns.
-    - Preserve tool_calls on assistant messages.
+    - Remove <think>…</think> blocks and legacy [→ tool] markers from
+      previous assistant turns.
+    - Preserve tool_calls (flat) and thinking on assistant messages.
     - Keep system message as-is.
-    - Limit history to *max_history_turns* user+assistant pairs
-      (controlled by CHATD_MAX_HISTORY_TURNS env var, default 20).
+    - Limit history to *max_history_turns* user+assistant pairs.
     """
     system: Optional[Dict] = None
     turns: List[Dict] = []
@@ -287,6 +320,8 @@ def build_model_messages(
         content = m.get("content", "") or ""
         if role == "assistant":
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            # legacy cleanup — old sessions may contain [→ name] markers
+            content = re.sub(r"\[→\s*[^\]]+\]\s*", "", content).strip()
 
         if role == "system":
             system = {"role": "system", "content": content}
@@ -296,16 +331,12 @@ def build_model_messages(
         if role == "assistant":
             if m.get("tool_calls"):
                 entry["tool_calls"] = m["tool_calls"]
-            if m.get("reasoning_content"):
-                entry["reasoning_content"] = m["reasoning_content"]
+            if m.get("thinking"):
+                entry["thinking"] = m["thinking"]
         turns.append(entry)
 
-    user_idx = [i for i, t in enumerate(turns) if t["role"] == "user"]
-    if len(user_idx) > max_history_turns:
-        turns = turns[user_idx[-max_history_turns]:]
-
-    while turns and turns[0]["role"] == "tool":
-        turns.pop(0)
+    if len(turns) > max_history_turns * 2:
+        turns = turns[-(max_history_turns * 2):]
 
     result = []
     if system:
@@ -885,7 +916,6 @@ def chat_stream_generator(
             built_messages = build_model_messages(messages)
             payload = make_ollama_payload(model, built_messages, round_options, stream=True)
 
-            # On the last allowed round, strip tools so the model MUST produce text
             is_last_round = (round_num == MAX_TOOL_ROUNDS - 1)
             if is_last_round:
                 payload.pop("tools", None)
@@ -900,9 +930,11 @@ def chat_stream_generator(
             )
 
             last_tool_calls: Optional[List[Dict]] = None
-            last_reasoning: str = ""
+            last_thinking: str = ""
+            last_content: str = ""
             chunk_count = 0
-            remapper = ThinkingRemapper(model)
+            stream_done_reason = "stop"
+            stream_usage: Optional[Dict[str, Any]] = None
 
             try:
                 stream = backend.chat_stream(payload)
@@ -916,48 +948,50 @@ def chat_stream_generator(
                     if not line:
                         continue
                     try:
-                        chunk = json.loads(line.decode("utf-8") if isinstance(line, bytes) else line)
+                        chunk = json.loads(
+                            line.decode("utf-8") if isinstance(line, bytes) else line
+                        )
                     except json.JSONDecodeError as e:
                         log.warning("[%s] bad JSON line: %s | %r", req_id, e, line[:120])
                         continue
 
                     chunk_count += 1
-                    msg  = chunk.get("message") or {}
+                    msg = chunk.get("message") or {}
                     done = chunk.get("done", False)
-                    tc   = msg.get("tool_calls")
-                    if msg.get("reasoning_content"):
-                        last_reasoning += msg["reasoning_content"]
 
-                    if tc:
+                    thinking = msg.get("thinking") or ""
+                    content = msg.get("content") or ""
+
+                    if thinking:
+                        last_thinking += thinking
+                        yield _log_yield(
+                            req_id, f"think/{chunk_count}",
+                            make_event_chunk(model, "thinking", {"delta": thinking}),
+                        )
+
+                    if msg.get("tool_calls"):
                         log.info("[%s] tool_calls: %s", req_id,
-                                 [c.get("function", {}).get("name") for c in tc])
-                        last_tool_calls = tc
+                                 [c.get("name") for c in msg["tool_calls"]])
+                        last_tool_calls = msg["tool_calls"]
+
+                    if content and not msg.get("tool_calls"):
+                        last_content += content
+                        yield _log_yield(
+                            req_id, f"chunk/{chunk_count}",
+                            make_chunk(model, content, done=False),
+                        )
 
                     if done:
-                        done_reason = chunk.get("done_reason", "?")
+                        stream_done_reason = chunk.get("done_reason", "stop")
+                        stream_usage = chunk.get("usage")
                         log.info(
-                            "[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d, done_reason=%s",
+                            "[%s] round %d done, chunks=%d, tool_calls=%s, "
+                            "content_len=%d, done_reason=%s",
                             req_id, round_num, chunk_count,
-                            bool(last_tool_calls), len(remapper.content_acc), done_reason,
+                            bool(last_tool_calls), len(last_content),
+                            stream_done_reason,
                         )
-                        closing = remapper.close()
-                        if closing:
-                            yield _log_yield(req_id, "think/close", closing)
-                        if last_tool_calls:
-                            yield _log_yield(req_id, "keepalive/tc", make_keepalive(model))
-                        else:
-                            final_assistant_content = remapper.content_acc
-                            yield _log_yield(req_id, "done", remapper.feed(line))
                         break
-
-                    out = remapper.feed(line)
-                    if not tc:
-                        log.debug(
-                            "[%s] yield %-12s %d bytes: ...%s",
-                            req_id, f"chunk/{chunk_count}", len(out),
-                            out[-60:].decode("utf-8", errors="replace").strip(),
-                        )
-                        yield out
 
             except RequestException as e:
                 log.error("[%s] network error during stream: %s", req_id, e)
@@ -968,9 +1002,15 @@ def chat_stream_generator(
                 )
                 return
 
-            log.debug("[%s] exited stream, last_tool_calls=%s", req_id, bool(last_tool_calls))
+            log.debug("[%s] exited stream, last_tool_calls=%s",
+                      req_id, bool(last_tool_calls))
 
             if not last_tool_calls:
+                final_assistant_content = last_content
+                yield _log_yield(
+                    req_id, "done",
+                    make_done_chunk(model, stream_done_reason, stream_usage),
+                )
                 log.info("[%s] stream complete, no more tool rounds", req_id)
                 break
 
@@ -987,49 +1027,58 @@ def chat_stream_generator(
                 repeat_count = 0
             prev_tool_calls = last_tool_calls
 
+            # assistant turn — flat tool_calls + thinking
             assistant_entry: Dict[str, Any] = {
                 "role":       "assistant",
-                "content":    remapper.content_acc,
+                "content":    last_content,
                 "tool_calls": last_tool_calls,
             }
-            if last_reasoning:
-                assistant_entry["reasoning_content"] = last_reasoning
-
+            if last_thinking:
+                assistant_entry["thinking"] = last_thinking
             messages.append(assistant_entry)
-            last_reasoning = ""
 
+            # tool_call + tool_result as events
             for tc in last_tool_calls:
-                fn        = tc.get("function") or {}
-                tool_name = fn.get("name") or "unknown"
-                tool_args = fn.get("arguments") or {}
-                if isinstance(tool_args, str):
-                    try:
-                        tool_args = json.loads(tool_args)
-                    except json.JSONDecodeError:
-                        log.warning("[%s] failed to parse tool_args for %s", req_id, tool_name)
-                        tool_args = {}
+                tool_name = tc.get("name") or "unknown"
+                tool_args = tc.get("arguments") or {}
+                call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:16]}"
+
+                yield _log_yield(
+                    req_id, "tool/call",
+                    make_event_chunk(model, "tool_call", {
+                        "id":        call_id,
+                        "name":      tool_name,
+                        "arguments": tool_args,
+                    }),
+                )
 
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
-                yield _log_yield(req_id, "tool/ann", make_chunk(model, f"\n[→ {tool_name}]\n\n"))
-
                 tool_result = call_tool(tool_name, tool_args)
 
-                if isinstance(tool_result, dict) and "error" in tool_result:
-                    log.warning(
-                        "[%s] tool %s error (passed to model): %s",
-                        req_id, tool_name, tool_result["error"],
-                    )
+                status = "error" if (
+                    isinstance(tool_result, dict) and "error" in tool_result
+                ) else "ok"
+                result_str = _truncate_chat_tool_result(tool_result)
+
+                yield _log_yield(
+                    req_id, "tool/result",
+                    make_event_chunk(model, "tool_result", {
+                        "id":      call_id,
+                        "name":    tool_name,
+                        "status":  status,
+                        "content": result_str,
+                    }),
+                )
 
                 messages.append({
                     "role":    "tool",
-                    "content": _truncate_chat_tool_result(tool_result),
+                    "content": result_str,
                 })
 
             yield _log_yield(req_id, "keepalive/tr", make_keepalive(model))
             last_tool_calls = None
-            # End for
 
-        # Force without tools
+        # Fallback: if we never produced final text, force one more call without tools
         if not final_assistant_content:
             log.info("[%s] no final content after loop - forcing final answer without tools",
                      req_id)
@@ -1039,7 +1088,6 @@ def chat_stream_generator(
 
             try:
                 final_stream = backend.chat_stream(final_payload)
-                remapper_final = ThinkingRemapper(model)
                 for line in final_stream:
                     if not line:
                         continue
@@ -1050,17 +1098,33 @@ def chat_stream_generator(
                     except json.JSONDecodeError:
                         continue
 
-                    done = chunk.get("done", False)
-                    if done:
-                        closing = remapper_final.close()
-                        if closing:
-                            yield _log_yield(req_id, "final/close", closing)
-                        final_assistant_content = remapper_final.content_acc
-                        yield _log_yield(req_id, "final/done", remapper_final.feed(line))
-                        break
+                    msg = chunk.get("message") or {}
+                    thinking = msg.get("thinking") or ""
+                    content = msg.get("content") or ""
 
-                    out = remapper_final.feed(line)
-                    yield _log_yield(req_id, "final/chunk", out)
+                    if thinking:
+                        yield _log_yield(
+                            req_id, "final/think",
+                            make_event_chunk(model, "thinking", {"delta": thinking}),
+                        )
+
+                    if content and not msg.get("tool_calls"):
+                        final_assistant_content += content
+                        yield _log_yield(
+                            req_id, "final/chunk",
+                            make_chunk(model, content, done=False),
+                        )
+
+                    if chunk.get("done"):
+                        yield _log_yield(
+                            req_id, "final/done",
+                            make_done_chunk(
+                                model,
+                                chunk.get("done_reason", "stop"),
+                                chunk.get("usage"),
+                            ),
+                        )
+                        break
 
             except Exception as e:
                 log.error("[%s] final answer failed: %s", req_id, e)
@@ -1222,18 +1286,20 @@ def generate():
                 yield raw
                 continue
 
-            msg     = obj.get("message") or {}
-            content = msg.get("content") or ""
-
+            msg = obj.get("message") or {}
             out = {
                 "model":      obj.get("model") or model,
                 "created_at": obj.get("created_at") or now_iso(),
-                "response":   content,
+                "response":   msg.get("content") or "",
                 "done":       obj.get("done", False),
             }
+            if "event" in obj:
+                out["event"] = obj["event"]
+                out["response"] = ""
             if obj.get("done"):
                 out["done_reason"] = obj.get("done_reason", "stop")
-
+                if "usage" in obj:
+                    out["usage"] = obj["usage"]
             yield (json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8")
 
     log.info("[%s] starting generate stream", req_id)
