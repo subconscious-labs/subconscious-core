@@ -2,9 +2,12 @@ __pycache__/
 venv/
 *.db
 *.yaml
-.env
-.env.local
-identity.local.txt
 mcp/*
 !mcp/.gitkeep
+
+# local
+.env
+.env.local
 tool_descriptions.ini
+identity.local.txt
+todo.md

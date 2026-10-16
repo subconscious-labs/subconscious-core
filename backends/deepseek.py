@@ -96,14 +96,21 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
             if pending_tc_index < len(pending_tc_ids):
                 tc_id = pending_tc_ids[pending_tc_index]
                 pending_tc_index += 1
+                converted.append({
+                    "role":         "tool",
+                    "tool_call_id": tc_id,
+                    "content":      m.get("content") or "",
+                })
             else:
-                tc_id = _make_tc_id()
-                log.warning("[deepseek] tool message without matching assistant tool_call_id")
-            converted.append({
-                "role":         "tool",
-                "tool_call_id": tc_id,
-                "content":      m.get("content") or "",
-            })
+                # Orphaned tool message. DeepSeek rejects the whole payload
+                # with HTTP 400 if this reaches the wire. Drop it instead
+                # of fabricating a tool_call_id — the model never saw a
+                # matching assistant call, so the result is meaningless.
+                log.warning(
+                    "[deepseek] dropping orphan tool message (%d chars); "
+                    "history was likely cut mid-tool-sequence",
+                    len(m.get("content") or ""),
+                )
 
         else:
             converted.append({"role": role, "content": m.get("content") or ""})

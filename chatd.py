@@ -371,7 +371,18 @@ def build_model_messages(
         turns.append(entry)
 
     if len(turns) > max_history_turns * 2:
-        turns = turns[-(max_history_turns * 2):]
+        cutoff = len(turns) - max_history_turns * 2
+        # Never cut in the middle of a tool-result sequence. An orphaned
+        # `tool` message without a preceding assistant with tool_calls
+        # makes OpenAI-compatible providers reject the entire payload:
+        #   "Messages with role 'tool' must be a response to a preceding
+        #    message with 'tool_calls'"
+        # Skipping forward past leading tool messages loses a bit more
+        # history than max_history_turns implies, but keeps the payload
+        # valid.
+        while cutoff < len(turns) and turns[cutoff].get("role") == "tool":
+            cutoff += 1
+        turns = turns[cutoff:]
 
     result = []
     if system:
