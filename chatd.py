@@ -100,12 +100,15 @@ _EVENT_DIRECTIVE = (
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def _tc_signature(tc_list: List[Dict]) -> str:
-    """Stable hash of tool_calls, including arguments."""
+    """Stable hash of tool_calls, including arguments.
+
+    Expects FLAT internal form:
+      [{"id": "...", "name": "...", "arguments": {...}}]
+    """
     parts = []
     for tc in tc_list:
-        fn = tc.get("function") or {}
-        name = fn.get("name") or ""
-        args = fn.get("arguments")
+        name = tc.get("name") or ""
+        args = tc.get("arguments")
         if isinstance(args, dict):
             args = json.dumps(args, sort_keys=True, ensure_ascii=False)
         parts.append(f"{name}:{args}")
@@ -322,6 +325,7 @@ def build_model_messages(
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             # legacy cleanup — old sessions may contain [→ name] markers
             content = re.sub(r"\[→\s*[^\]]+\]\s*", "", content).strip()
+            content = _strip_dsml(content)
 
         if role == "system":
             system = {"role": "system", "content": content}
@@ -400,6 +404,87 @@ def make_ollama_payload(
 
 # ── tool loop helper ──────────────────────────────────────────────────────────
 
+_DSML_MARKER = "｜｜DSML｜｜"
+_DSML_TRIGGER = "｜"
+
+
+class DSMLFilter:
+    """Stateful stripper for DeepSeek DSML tool-call markup.
+
+    DSML arrives as plain text inside `message.content` when DeepSeek Flash
+    wants to call a tool but tools were stripped from the payload. The
+    markup looks like:
+
+        <｜｜DSML｜｜ calls>
+        <｜｜DSML｜｜ invoke name="foo">
+        ...
+        </｜｜DSML｜｜ calls>
+
+    In streaming mode the marker can be split across chunks, so a per-chunk
+    regex won't catch it. This filter buffers from the first `｜` until the
+    next newline, then decides: if the buffered line contains the marker,
+    drop it entirely; otherwise emit it unchanged.
+
+    A safety cap (BUFFER_CAP) flushes the buffer if no newline arrives, so
+    a stray `｜` in user text cannot stall the stream.
+    """
+
+    MARKER = _DSML_MARKER
+    TRIGGER = _DSML_TRIGGER
+    BUFFER_CAP = 8192
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_buffer = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        out: List[str] = []
+        for ch in text:
+            if not self._in_buffer:
+                if ch == self.TRIGGER:
+                    self._in_buffer = True
+                    self._buf = ch
+                else:
+                    out.append(ch)
+            else:
+                self._buf += ch
+                if ch == "\n":
+                    if self.MARKER not in self._buf:
+                        out.append(self._buf)
+                    self._buf = ""
+                    self._in_buffer = False
+                elif len(self._buf) > self.BUFFER_CAP:
+                    out.append(self._buf)
+                    self._buf = ""
+                    self._in_buffer = False
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Return anything still buffered at stream end."""
+        if not self._in_buffer:
+            return ""
+        leftover = self._buf
+        self._buf = ""
+        self._in_buffer = False
+        if self.MARKER in leftover:
+            return ""
+        return leftover
+
+
+def _strip_dsml(text: str) -> str:
+    """One-shot strip for non-streaming content (whole string at once)."""
+    if not text or _DSML_TRIGGER not in text:
+        return text
+    f = DSMLFilter()
+    return (f.feed(text) + f.flush()).strip()
+
+
+def _contains_dsml(text: str) -> bool:
+    return bool(text) and _DSML_MARKER in text
+
+
 def _truncate_chat_tool_result(result: Any) -> str:
     """Cap a tool result before feeding it back to the chat model."""
     if CHAT_TOOL_RESULT_MAX_CHARS <= 0:
@@ -435,11 +520,28 @@ def run_tool_loop(
     for i in range(MAX_TOOL_ROUNDS):
         round_options = _options_for_round(options, i)
         built = build_model_messages(messages)
+
+        is_last_round = (i == MAX_TOOL_ROUNDS - 1)
+        if is_last_round:
+            log.info("[%s] tool_loop round %d: tools stripped - forcing final answer",
+                     req_id, i)
+            # Mutate the LOCAL built list, not `messages` — callers rely on
+            # _last_user_text(messages) after we return, and appending a
+            # synthetic user turn would corrupt that.
+            built.append({
+                "role": "user",
+                "content": (
+                    "You have reached the tool-call limit. Provide your final "
+                    "answer NOW using plain text only. Do NOT emit tool calls, "
+                    "XML, or any special markup. A concise natural-language "
+                    "summary of what you found is required."
+                ),
+            })
+
         payload = make_ollama_payload(model, built, round_options, stream=False)
 
-        if i == MAX_TOOL_ROUNDS - 1:
+        if is_last_round:
             payload.pop("tools", None)
-            log.info("[%s] tool_loop round %d: tools stripped - forcing final answer", req_id, i)
 
         _log_payload_sizes(req_id, built, len(TOOLS), layer_sizes if i == 0 else None)
         log.debug("[%s] tool_loop round %d", req_id, i)
@@ -449,7 +551,7 @@ def run_tool_loop(
         tool_calls = msg.get("tool_calls") or []
 
         if not tool_calls:
-            content = (msg.get("content") or "").strip()
+            content = _strip_dsml((msg.get("content") or "").strip())
             if not content and final_num_predict:
                 log.debug(
                     "[%s] empty answer on round %d, retrying with num_predict=%d",
@@ -459,12 +561,15 @@ def run_tool_loop(
                 boosted["num_predict"] = final_num_predict
                 payload2 = make_ollama_payload(model, built, boosted, stream=False)
                 resp2 = backend.chat_sync(payload2)
-                content2 = ((resp2.get("message") or {}).get("content") or "").strip()
+                content2 = _strip_dsml(
+                    ((resp2.get("message") or {}).get("content") or "").strip()
+                )
                 if content2:
                     return content2
+
             break
 
-        tc_names = [(tc.get("function") or {}).get("name") for tc in tool_calls]
+        tc_names = [tc.get("name") for tc in tool_calls]
         log.info("[%s] tool_calls: %s", req_id, tc_names)
 
         current_sig = _tc_signature(tool_calls)
@@ -481,15 +586,15 @@ def run_tool_loop(
             "content":    msg.get("content") or "",
             "tool_calls": tool_calls,
         }
-        if msg.get("reasoning_content"):
-            assistant_msg["reasoning_content"] = msg["reasoning_content"]
+
+        if msg.get("thinking"):
+            assistant_msg["thinking"] = msg["thinking"]
 
         messages.append(assistant_msg)
 
         for tc in tool_calls:
-            fn   = tc.get("function") or {}
-            name = fn.get("name") or "unknown"
-            args = fn.get("arguments") or {}
+            name = tc.get("name") or "unknown"
+            args = tc.get("arguments") or {}
             if isinstance(args, str):
                 try:
                     args = json.loads(args)
@@ -503,7 +608,8 @@ def run_tool_loop(
                 "content": _truncate_chat_tool_result(result),
             })
 
-    return ((resp.get("message") or {}).get("content") or "").strip()
+    final_text = (resp.get("message") or {}).get("content") or ""
+    return _strip_dsml(final_text).strip()
 
 
 # ── CORS ───────────────────────────────────────────────────────────────────────
@@ -932,6 +1038,8 @@ def chat_stream_generator(
             last_tool_calls: Optional[List[Dict]] = None
             last_thinking: str = ""
             last_content: str = ""
+            last_content_raw: str = ""
+            dsml_filter = DSMLFilter()
             chunk_count = 0
             stream_done_reason = "stop"
             stream_usage: Optional[Dict[str, Any]] = None
@@ -975,11 +1083,14 @@ def chat_stream_generator(
                         last_tool_calls = msg["tool_calls"]
 
                     if content and not msg.get("tool_calls"):
-                        last_content += content
-                        yield _log_yield(
-                            req_id, f"chunk/{chunk_count}",
-                            make_chunk(model, content, done=False),
-                        )
+                        last_content_raw += content
+                        cleaned = dsml_filter.feed(content)
+                        if cleaned:
+                            last_content += cleaned
+                            yield _log_yield(
+                                req_id, f"chunk/{chunk_count}",
+                                make_chunk(model, cleaned, done=False),
+                            )
 
                     if done:
                         stream_done_reason = chunk.get("done_reason", "stop")
@@ -1002,11 +1113,29 @@ def chat_stream_generator(
                 )
                 return
 
+            tail = dsml_filter.flush()
+            if tail:
+                last_content += tail
+                yield _log_yield(
+                    req_id, "chunk/tail",
+                    make_chunk(model, tail, done=False),
+                )
+
             log.debug("[%s] exited stream, last_tool_calls=%s",
                       req_id, bool(last_tool_calls))
 
             if not last_tool_calls:
                 final_assistant_content = last_content
+                if not final_assistant_content and _contains_dsml(last_content_raw):
+                    log.warning(
+                        "[%s] DSML-only response, no text after strip", req_id,
+                    )
+                    final_assistant_content = (
+                        "[Не удалось получить текстовый ответ: модель "
+                        "попыталась вызвать инструменты после исчерпания "
+                        "лимита раундов. Увеличьте SUBCONSCIOUS_MAX_TOOL_ROUNDS "
+                        "или переформулируйте запрос.]"
+                    )
                 yield _log_yield(
                     req_id, "done",
                     make_done_chunk(model, stream_done_reason, stream_usage),
@@ -1082,11 +1211,23 @@ def chat_stream_generator(
         if not final_assistant_content:
             log.info("[%s] no final content after loop - forcing final answer without tools",
                      req_id)
+            # Explicit instruction: models that ignored the tool-strip hint
+            # (DeepSeek Flash in particular) fall back to DSML text otherwise.
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You have reached the tool-call limit. Provide your final "
+                    "answer NOW using plain text only. Do NOT emit tool calls, "
+                    "XML, or any special markup. A concise natural-language "
+                    "summary of what you found is required."
+                ),
+            })
             final_built = build_model_messages(messages)
             final_payload = make_ollama_payload(model, final_built, options, stream=True)
             final_payload.pop("tools", None)
 
             try:
+                dsml_final = DSMLFilter()
                 final_stream = backend.chat_stream(final_payload)
                 for line in final_stream:
                     if not line:
@@ -1109,11 +1250,13 @@ def chat_stream_generator(
                         )
 
                     if content and not msg.get("tool_calls"):
-                        final_assistant_content += content
-                        yield _log_yield(
-                            req_id, "final/chunk",
-                            make_chunk(model, content, done=False),
-                        )
+                        cleaned = dsml_final.feed(content)
+                        if cleaned:
+                            final_assistant_content += cleaned
+                            yield _log_yield(
+                                req_id, "final/chunk",
+                                make_chunk(model, cleaned, done=False),
+                            )
 
                     if chunk.get("done"):
                         yield _log_yield(
@@ -1125,6 +1268,14 @@ def chat_stream_generator(
                             ),
                         )
                         break
+
+                tail = dsml_final.flush()
+                if tail:
+                    final_assistant_content += tail
+                    yield _log_yield(
+                        req_id, "final/tail",
+                        make_chunk(model, tail, done=False),
+                    )
 
             except Exception as e:
                 log.error("[%s] final answer failed: %s", req_id, e)
