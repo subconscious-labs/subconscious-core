@@ -154,17 +154,17 @@ def make_event_chunk(
 def make_thinking_chunk(model: str, delta: str) -> bytes:
     """Thinking delta, dual-channel.
 
-    Emits `message.reasoning` for clients that read reasoning there
-    (Hollama uses this field). Also emits `event.type == "thinking"` for
-    clients that consume typed events without polluting message content.
+    Emits `message.thinking` for Ollama-native clients (Hollama reads
+    this field for Qwen3-style thinking). Also emits
+    `event.type == "thinking"` for event-aware clients.
     """
     obj: Dict[str, Any] = {
         "model":      model,
         "created_at": now_iso(),
         "message": {
-            "role":      "assistant",
-            "content":   "",
-            "reasoning": delta,
+            "role":     "assistant",
+            "content":  "",
+            "thinking": delta,
         },
         "event": {"type": "thinking", "delta": delta},
         "done": False,
