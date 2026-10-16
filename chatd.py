@@ -151,6 +151,27 @@ def make_event_chunk(
     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def make_thinking_chunk(model: str, delta: str) -> bytes:
+    """Thinking delta, dual-channel.
+
+    Emits `message.reasoning` for clients that read reasoning there
+    (Hollama uses this field). Also emits `event.type == "thinking"` for
+    clients that consume typed events without polluting message content.
+    """
+    obj: Dict[str, Any] = {
+        "model":      model,
+        "created_at": now_iso(),
+        "message": {
+            "role":      "assistant",
+            "content":   "",
+            "reasoning": delta,
+        },
+        "event": {"type": "thinking", "delta": delta},
+        "done": False,
+    }
+    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+
 def make_done_chunk(
     model: str,
     done_reason: str = "stop",
@@ -335,8 +356,10 @@ def build_model_messages(
         if role == "assistant":
             if m.get("tool_calls"):
                 entry["tool_calls"] = m["tool_calls"]
-            if m.get("thinking"):
-                entry["thinking"] = m["thinking"]
+            # NOTE: thinking/reasoning is deliberately dropped from history.
+            # Reasoning is display-only; re-feeding it bloats context and
+            # DeepSeek rejects reasoning_content in input on some API
+            # versions. Backends therefore never see it here.
         turns.append(entry)
 
     if len(turns) > max_history_turns * 2:
@@ -1074,7 +1097,7 @@ def chat_stream_generator(
                         last_thinking += thinking
                         yield _log_yield(
                             req_id, f"think/{chunk_count}",
-                            make_event_chunk(model, "thinking", {"delta": thinking}),
+                            make_thinking_chunk(model, thinking),
                         )
 
                     if msg.get("tool_calls"):
@@ -1246,7 +1269,7 @@ def chat_stream_generator(
                     if thinking:
                         yield _log_yield(
                             req_id, "final/think",
-                            make_event_chunk(model, "thinking", {"delta": thinking}),
+                            make_thinking_chunk(model, thinking),
                         )
 
                     if content and not msg.get("tool_calls"):
