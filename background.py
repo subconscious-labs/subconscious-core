@@ -782,18 +782,21 @@ def _truncate_tool_result(result: Any, limit: Optional[int] = None) -> str:
 
 def _execute_tool_call(tc: Dict[str, Any]) -> Any:
     import chatd
-    fn = tc.get("function") or {}
-    name = fn.get("name") or "unknown"
-    args = fn.get("arguments") or {}
+
+    name = tc.get("name") or "unknown"
+    args = tc.get("arguments") or {}
     if isinstance(args, str):
         try:
             args = json.loads(args)
         except json.JSONDecodeError:
             args = {}
+
     # Defense in depth: the tool schema list already excludes internal tools
     # (not in BG_TOOLS_ALLOWED), but if the model hallucinates one, reject.
     if name not in BG_TOOLS_ALLOWED:
+        log.warning("[bg tool] rejected unknown tool: %r args=%r", name, args)
         return {"error": f"tool not allowed in background: {name}"}
+
     try:
         return chatd.call_tool(name, args)
     except Exception as e:  # noqa: BLE001
@@ -1117,7 +1120,8 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         seed_name = (seed.get("function") or {}).get("name", "?")
         log.info("[bg executor] exploratory seed tool: %s", seed_name)
         seed_result = _execute_tool_call({
-            "function": {"name": seed_name, "arguments": {}}
+            "name": seed_name,
+            "arguments": {},
         })
         if seed_result is None:
             seed_result = {"result": None, "note": "tool returned no data"}
