@@ -1205,11 +1205,32 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
 
     messages.append({
         "role": "user",
-        "content": "Now produce ONLY the JSON summary object.",
+        "content": (
+            "Now produce ONLY the JSON summary object. Do NOT call any "
+            "tools. If you need more information, describe what you would "
+            "need in the observation field - do not call tools."
+        ),
     })
     try:
-        resp = _llm_call(messages, model, tools=None, num_predict=BG_NUM_PREDICT)
+        # Keep tools in the payload to preserve the DeepSeek prefix cache.
+        # The tool schema block is part of the cache key; stripping it here
+        # resets cache_hit to just the base system prompt, forcing a full
+        # re-evaluation of the accumulated tool-loop history.
+        resp = _llm_call(messages, model, tools=tools, num_predict=BG_NUM_PREDICT)
         tokens_total += resp["tokens"]
+
+        # If the model disobeys the instruction and calls tools, fall back
+        # to the old behaviour (tools stripped) for one clean summary round.
+        if resp.get("tool_calls"):
+            log.info(
+                "[bg executor] summary call returned %d tool_calls; "
+                "retrying with tools stripped",
+                len(resp["tool_calls"]),
+            )
+            resp = _llm_call(messages, model, tools=None,
+                             num_predict=BG_NUM_PREDICT)
+            tokens_total += resp["tokens"]
+
         parsed = _extract_json(resp["content"]) or {}
     except Exception as e:
         log.warning("[bg executor] summary call failed: %s", e)
