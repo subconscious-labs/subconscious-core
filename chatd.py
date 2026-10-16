@@ -268,22 +268,22 @@ def ensure_system_prompt(
     messages: List[Dict[str, Any]],
     session: Optional[sess.Session] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Assemble the always-loaded memory block and prepend it as system message.
+    """Assemble system prompt and inject request-scoped RAG context.
 
-    L0+L1 (wake-up base) is cached per session - rebuilt only on the first
-    request of each session, or after a mempalace write operation invalidates
-    the cache.  L1.5 (KG recall + RAG sidecar) is always computed per-request
-    because it depends on the current user message.
+    Layout sent to the backend:
+      [system: L0+L1 wake-up]
+      [history ...]
+      [user: L1.5 RAG sidecar + original user text]
 
-    Returns (messages, layer_sizes) where layer_sizes maps layer name to char count:
-      L0+L1     mempalace identity + wake-up base (Essential Story included)
-      L1.5_kg   KG recall sidecar
-      L1.5_rag  RAG recall sidecar
+    RAG is deliberately placed in the last user message, not the system
+    block. DeepSeek (and other OpenAI-compatible providers) cache stable
+    prefixes server-side; putting the per-request RAG block at the very
+    end maximises the cached prefix between consecutive turns.
 
-    Note: L0.5g (global summary) is intentionally omitted - MemPalace wake-up
-    already covers the same information.
+    Returns (messages, layer_sizes) where layer_sizes maps layer name to
+    char count: L0+L1, L1.5_kg, L1.5_rag.
     """
-    # L0+L1: use session cache when available
+    # L0+L1: cached per session
     if session is not None:
         base_prompt = session.get_cached_base_prompt()
         if base_prompt is None:
@@ -301,24 +301,32 @@ def ensure_system_prompt(
         "L1.5_rag": 0,
     }
 
-    # L1.5: always per-request - KG and RAG depend on the current question
-    last_user = _last_user_text(messages)
-    if last_user:
-        rag_ctx = rag.retrieve(last_user)
+    # Copy so we never mutate the caller's message list.
+    msgs: List[Dict[str, Any]] = [dict(m) for m in (messages or [])]
+
+    # Ensure exactly one system message on top, holding only L0+L1.
+    if msgs and msgs[0].get("role") == "system":
+        msgs[0] = {"role": "system", "content": base_prompt}
+    else:
+        msgs.insert(0, {"role": "system", "content": base_prompt})
+
+    # L1.5: attach to the last user message.
+    original_user = _last_user_text(msgs)
+    if original_user:
+        rag_ctx = rag.retrieve(original_user)
         if rag_ctx:
             layer_sizes["L1.5_rag"] = len(rag_ctx)
-            log.debug("[sidecar] injecting %d-char RAG recall into system prompt", len(rag_ctx))
-            base_prompt = f"{base_prompt}\n\n# Relevant past context\n{rag_ctx}"
+            log.debug("[sidecar] injecting %d-char RAG recall into last user message",
+                      len(rag_ctx))
+            for i in range(len(msgs) - 1, -1, -1):
+                if msgs[i].get("role") == "user":
+                    msgs[i]["content"] = (
+                        f"# Relevant past context\n{rag_ctx}\n\n"
+                        f"---\n\n{original_user}"
+                    )
+                    break
 
-    system_prompt = base_prompt
-
-    if not isinstance(messages, list) or not messages:
-        return [{"role": "system", "content": system_prompt}], layer_sizes
-    if messages[0].get("role") != "system":
-        result = [{"role": "system", "content": system_prompt}] + messages
-    else:
-        result = [{"role": "system", "content": system_prompt}] + messages[1:]
-    return result, layer_sizes
+    return msgs, layer_sizes
 
 
 def build_model_messages(
@@ -1024,11 +1032,14 @@ def chat_stream_generator(
     session: Optional[sess.Session],
     layer_sizes: Dict[str, int],
     req_id: str = "-",
+    clean_user: str = "",
 ) -> Generator[bytes, None, None]:
     prev_tool_calls: Optional[List[str]] = None
     repeat_count = 0
 
-    last_user_msg = _last_user_text(messages)
+    # For session log and RAG index we want the ORIGINAL user text,
+    # without the RAG sidecar ensure_system_prompt appended.
+    last_user_msg = clean_user or _last_user_text(messages)
 
     data = make_keepalive(model)
     log.debug("[%s] yield %-12s %d bytes", req_id, "keepalive/0", len(data))
@@ -1356,6 +1367,11 @@ def chat():
 
     log.info("[%s] chat_id=%s", req_id, chat_id)
 
+    # Capture the ORIGINAL user text before RAG injection. Session log and
+    # RAG index must store what the human wrote, not the augmented prompt —
+    # otherwise RAG would index its own sidecar and echo it back next turn.
+    original_user = _last_user_text(messages)
+
     messages, layer_sizes = ensure_system_prompt(messages, session=session)
 
     log.info("[%s] POST /api/chat model=%s stream=%s messages=%d options=%s",
@@ -1365,19 +1381,17 @@ def chat():
         try:
             answer = run_tool_loop(model, messages, options, layer_sizes, req_id)
 
-            if session and answer:
-                last_user = _last_user_text(messages)
-                if last_user:
-                    log.debug(
-                        "[%s] non-stream: saving turn session=%s user=%d chars answer=%d chars",
-                        req_id, session.session_id, len(last_user), len(answer),
-                    )
-                    sess.record_turn(session, last_user, answer)
-                    rag.index_turn(
-                        source=f"session:{session.session_id}",
-                        user=last_user,
-                        assistant=answer,
-                    )
+            if session and answer and original_user:
+                log.debug(
+                    "[%s] non-stream: saving turn session=%s user=%d chars answer=%d chars",
+                    req_id, session.session_id, len(original_user), len(answer),
+                )
+                sess.record_turn(session, original_user, answer)
+                rag.index_turn(
+                    source=f"session:{session.session_id}",
+                    user=original_user,
+                    assistant=answer,
+                )
 
             log.info("[%s] non-stream done, answer_len=%d", req_id, len(answer))
             return jsonify({"model": model, "answer": answer})
@@ -1392,7 +1406,10 @@ def chat():
     log.info("[%s] starting stream generator", req_id)
     return Response(
         stream_with_context(
-            chat_stream_generator(model, messages, options, session, layer_sizes, req_id)
+            chat_stream_generator(
+                model, messages, options, session, layer_sizes, req_id,
+                clean_user=original_user,
+            )
         ),
         content_type="application/x-ndjson",
         headers={
