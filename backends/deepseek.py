@@ -113,6 +113,11 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
         "messages": converted,
         "stream":   stream,
     }
+    if stream:
+        # Ask OpenAI-compatible providers (DeepSeek included) to send a
+        # trailing usage-only chunk before [DONE]. Without this, no token
+        # accounting is available on the streaming path.
+        body["stream_options"] = {"include_usage": True}
 
     options = payload.get("options") or {}
     if options.get("response_format") == "json":
@@ -171,23 +176,52 @@ def _finalise_tc(acc: List[Dict]) -> List[Dict]:
 # ── stream: SSE → normalized NDJSON ──────────────────────────────────────────
 
 def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
-    """DeepSeek SSE (OpenAI delta) → normalized internal NDJSON chunks."""
+    """DeepSeek SSE (OpenAI delta) → normalized internal NDJSON chunks.
+
+    Emits exactly one done=True chunk, at [DONE], carrying the final
+    done_reason, tool_calls (if any) and usage (if stream_options enabled).
+    Content and thinking deltas are emitted as done=False chunks as they
+    arrive. Never emits an intermediate done=True — chatd breaks on the
+    first one and would miss the trailing usage chunk.
+    """
     tc_acc: List[Dict] = []
+    usage_acc: Dict[str, Any] = {}
+    finish_reason: str = "stop"
 
     for raw in response.iter_lines():
         if not raw:
             continue
         line = raw.decode("utf-8").removeprefix("data: ")
+
         if line.strip() == "[DONE]":
             out: Dict[str, Any] = {
-                "model":   model,
+                "model": model,
                 "message": {"role": "assistant", "content": ""},
-                "done":    True,
-                "done_reason": "stop",
+                "done": True,
+                "done_reason": "tool_calls" if tc_acc else finish_reason,
             }
             if tc_acc:
                 out["message"]["tool_calls"] = _finalise_tc(tc_acc)
-                out["done_reason"] = "tool_calls"
+            if usage_acc:
+                out["usage"] = {
+                    "prompt_tokens":     int(usage_acc.get("prompt_tokens") or 0),
+                    "completion_tokens": int(usage_acc.get("completion_tokens") or 0),
+                    "reasoning_tokens":  int(
+                        (usage_acc.get("completion_tokens_details") or {})
+                        .get("reasoning_tokens") or 0
+                    ),
+                    "cache_hit_tokens":  int(usage_acc.get("prompt_cache_hit_tokens") or 0),
+                    "cache_miss_tokens": int(usage_acc.get("prompt_cache_miss_tokens") or 0),
+                }
+                log.info(
+                    "[deepseek stream] prompt_tokens=%s completion_tokens=%s "
+                    "reasoning_tokens=%s cache_hit=%s cache_miss=%s",
+                    usage_acc.get("prompt_tokens"),
+                    usage_acc.get("completion_tokens"),
+                    (usage_acc.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+                    usage_acc.get("prompt_cache_hit_tokens"),
+                    usage_acc.get("prompt_cache_miss_tokens"),
+                )
             yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
             return
 
@@ -196,13 +230,18 @@ def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
         except json.JSONDecodeError:
             continue
 
+        # Usage arrives on its own trailing chunk (choices empty).
+        if chunk.get("usage"):
+            usage_acc = chunk["usage"]
+
         choice = (chunk.get("choices") or [{}])[0]
         delta  = choice.get("delta") or {}
         finish = choice.get("finish_reason")
+        if finish:
+            finish_reason = finish
 
-        # reasoning delta → отдельный чанк с message.thinking
         if delta.get("reasoning_content"):
-            out = {
+            yield (json.dumps({
                 "model": model,
                 "message": {
                     "role":     "assistant",
@@ -210,27 +249,21 @@ def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
                     "thinking": delta["reasoning_content"],
                 },
                 "done": False,
-            }
-            yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
+            }, ensure_ascii=False) + "\n").encode()
 
         if delta.get("tool_calls"):
             _merge_tc(tc_acc, delta["tool_calls"])
             continue
 
         content = delta.get("content") or ""
-        if not content and not finish:
+        if not content:
             continue
 
-        out = {
+        yield (json.dumps({
             "model":   model,
             "message": {"role": "assistant", "content": content},
-            "done":    finish is not None,
-        }
-        if finish:
-            out["done_reason"] = finish
-            if tc_acc:
-                out["message"]["tool_calls"] = _finalise_tc(tc_acc)
-        yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
+            "done":    False,
+        }, ensure_ascii=False) + "\n").encode()
 
 
 # ── backend ──────────────────────────────────────────────────────────────────
