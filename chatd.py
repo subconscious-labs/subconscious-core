@@ -352,7 +352,7 @@ def build_model_messages(
         content = m.get("content", "") or ""
         if role == "assistant":
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-            # legacy cleanup — old sessions may contain [→ name] markers
+            # legacy cleanup - old sessions may contain [→ name] markers
             content = re.sub(r"\[→\s*[^\]]+\]\s*", "", content).strip()
             content = _strip_dsml(content)
 
@@ -567,7 +567,7 @@ def run_tool_loop(
         if is_last_round:
             log.info("[%s] tool_loop round %d: tools stripped - forcing final answer",
                      req_id, i)
-            # Mutate the LOCAL built list, not `messages` — callers rely on
+            # Mutate the LOCAL built list, not `messages` - callers rely on
             # _last_user_text(messages) after we return, and appending a
             # synthetic user turn would corrupt that.
             built.append({
@@ -725,7 +725,7 @@ def load_tools():
             })
             log.debug("[tools] registered: %s", name)
 
-    # Internal tools (in-process, not MCP) — chat-only.
+    # Internal tools (in-process, not MCP) - chat-only.
     for schema in internal_tools.get_schemas():
         fn = schema.get("function") or {}
         name = fn.get("name")
@@ -762,7 +762,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
         log.debug("[tool] calling internal %s with args: %s", name, arguments)
         result = internal_tools.call_internal(name, arguments)
         if name in ("subcortex_goals_create", "subcortex_goals_cancel"):
-            # Ledger changed — goal list may be embedded in cached wake-up.
+            # Ledger changed - goal list may be embedded in cached wake-up.
             sess.invalidate_all_prompt_caches()
         return result
 
@@ -1201,7 +1201,7 @@ def chat_stream_generator(
                 repeat_count = 0
             prev_tool_calls = last_tool_calls
 
-            # assistant turn — flat tool_calls + thinking
+            # assistant turn - flat tool_calls + thinking
             assistant_entry: Dict[str, Any] = {
                 "role":       "assistant",
                 "content":    last_content,
@@ -1379,7 +1379,7 @@ def chat():
     log.info("[%s] chat_id=%s", req_id, chat_id)
 
     # Capture the ORIGINAL user text before RAG injection. Session log and
-    # RAG index must store what the human wrote, not the augmented prompt —
+    # RAG index must store what the human wrote, not the augmented prompt -
     # otherwise RAG would index its own sidecar and echo it back next turn.
     original_user = _last_user_text(messages)
 

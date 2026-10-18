@@ -33,7 +33,7 @@ Normalized chunk shape (all backends MUST emit this):
 payload is always an Ollama-format dict:
   {"model": str, "messages": [...], "options": {...}, "tools": [...], "stream": bool}
 
-Incoming messages may carry `thinking` on assistant turns — backends map
+Incoming messages may carry `thinking` on assistant turns - backends map
 it to whatever their provider expects (e.g. DeepSeek uses `reasoning_content`).
 """
 from __future__ import annotations

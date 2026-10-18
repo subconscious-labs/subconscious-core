@@ -305,7 +305,7 @@ BG_RECENT_OBSERVATIONS_LIMIT: int = int(
 )
 
 # Max size of a tool result fed back to the chat model. Looser than the
-# background limit — the user is waiting and full results are more useful.
+# background limit - the user is waiting and full results are more useful.
 # 0 = no cap (not recommended).
 CHAT_TOOL_RESULT_MAX_CHARS: int = int(
     _env("CHAT_TOOL_RESULT_MAX_CHARS", "8000")
@@ -341,9 +341,9 @@ def _load_bg_prompt(name: str) -> str:
 
 
 # Wake-up mode for background phases.
-#   "none"     — no wake-up block at all (default for planner/reflector)
-#   "identity" — identity.txt only, no KG snippet
-#   "full"     — full wake-up (identity + KG)
+#   "none"     - no wake-up block at all (default for planner/reflector)
+#   "identity" - identity.txt only, no KG snippet
+#   "full"     - full wake-up (identity + KG)
 #
 # The background worker rarely needs the model's identity/KG context:
 # planner sees observations and goals, reflector sees one goal's history.

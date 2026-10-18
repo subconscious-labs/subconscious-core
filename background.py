@@ -741,7 +741,7 @@ def _system_block(phase: str) -> str:
     if mode == "identity":
         import memory
         return memory.wake_up_identity_only()
-    # "full" or anything unrecognised — fall back to full
+    # "full" or anything unrecognised - fall back to full
     import memory
     return memory.wake_up()
 
@@ -865,7 +865,7 @@ def _read_recent_normal_goals(limit: int = 5) -> List[Dict[str, Any]]:
 def _read_recent_archive(limit: int = 30) -> List[Dict[str, Any]]:
     """Return the last `limit` entries from goals.archive.jsonl.
 
-    Used by exploratory accounting, which must see completed goals too —
+    Used by exploratory accounting, which must see completed goals too -
     otherwise daily cap and min-interval reset every time an exploratory
     finishes and moves to the archive.
     """
@@ -910,7 +910,7 @@ def _planner() -> Dict[str, Any]:
 
     made_today = _new_goals_created_today()
 
-    # Recent normal goals — to prevent duplicate proposals. We look at
+    # Recent normal goals - to prevent duplicate proposals. We look at
     # the last 5 created normal goals regardless of status, because a
     # completed investigation shouldn't be repeated.
     recent_normal = _read_recent_normal_goals(limit=5)
@@ -1531,7 +1531,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         open_now = _open_goals(goals_now["goals"])
         if open_now:
             log.info(
-                "[bg %s] planner skipped with %d open goals — stopping",
+                "[bg %s] planner skipped with %d open goals - stopping",
                 req_id, len(open_now),
             )
             _append_journal({

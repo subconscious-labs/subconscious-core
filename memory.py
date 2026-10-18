@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""memory.py — memory abstraction for chatd.
+"""memory.py - memory abstraction for chatd.
 
 Layered memory model:
-  L0   mempalace : identity.txt — always loaded
-  L1   mempalace : Essential Story (wake-up context) — always loaded
-  L1.5 chatd     : request-scoped sidecar — RAG recall (KG recall removed)
-                   injected per request — always loaded
+  L0   mempalace : identity.txt - always loaded
+  L1   mempalace : Essential Story (wake-up context) - always loaded
+  L1.5 chatd     : request-scoped sidecar - RAG recall (KG recall removed)
+                   injected per request - always loaded
                    (disable with SUBCONSCIOUS_LAYER_15_ENABLED=false)
-  L2   mempalace : Room Recall (filtered retrieval) — when topic comes up
-  L3   mempalace : Deep Search (full semantic query) — when explicitly asked
+  L2   mempalace : Room Recall (filtered retrieval) - when topic comes up
+  L3   mempalace : Deep Search (full semantic query) - when explicitly asked
 
 mempalace layers (L0, L1, L2, L3) are managed by mempalace itself.
 chatd layer (L1.5) is a purely additive overlay.
@@ -128,6 +128,6 @@ def init() -> None:
         log.info("FastMemory: identity.txt loaded (%d chars)", len(identity))
     else:
         log.warning(
-            "FastMemory: identity.txt missing or empty — wake-up will be "
+            "FastMemory: identity.txt missing or empty - wake-up will be "
             "KG-only until it is created"
         )

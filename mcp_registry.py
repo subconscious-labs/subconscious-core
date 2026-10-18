@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mcp_registry.py — shared MCP tool registry.
+"""mcp_registry.py - shared MCP tool registry.
 
 Both chatd.py (during startup) and memory.py (for wake-up) need access to
 the same MCP clients. This module owns the registry and exposes a minimal
@@ -18,7 +18,7 @@ def reset(tools: List[Dict], registry: Dict[str, Any]) -> None:
     """Replace the registry. Called once at startup by chatd.init_tools().
 
     Internal tools (in-process, registered with client=None) stay in TOOLS
-    so they reach the LLM schema, but are excluded from REGISTRY — the
+    so they reach the LLM schema, but are excluded from REGISTRY - the
     background tick calls into mcp_registry, and internal tools must not be
     reachable through that path.
     """

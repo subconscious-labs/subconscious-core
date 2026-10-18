@@ -104,7 +104,7 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
             else:
                 # Orphaned tool message. DeepSeek rejects the whole payload
                 # with HTTP 400 if this reaches the wire. Drop it instead
-                # of fabricating a tool_call_id — the model never saw a
+                # of fabricating a tool_call_id - the model never saw a
                 # matching assistant call, so the result is meaningless.
                 log.warning(
                     "[deepseek] dropping orphan tool message (%d chars); "
@@ -188,7 +188,7 @@ def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
     Emits exactly one done=True chunk, at [DONE], carrying the final
     done_reason, tool_calls (if any) and usage (if stream_options enabled).
     Content and thinking deltas are emitted as done=False chunks as they
-    arrive. Never emits an intermediate done=True — chatd breaks on the
+    arrive. Never emits an intermediate done=True - chatd breaks on the
     first one and would miss the trailing usage chunk.
     """
     tc_acc: List[Dict] = []

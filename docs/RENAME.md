@@ -12,14 +12,14 @@
 | repo `chatd` | repo `subconscious-core` | GitHub redirect |
 | package `chatd` | package `subconscious` | `import chatd` shim (1–2 релиза) |
 | env `CHATD_*` | env `SUBCONSCIOUS_*` | читаются оба, warning на старое |
-| `chatd.py` | `subconscious/cortex/api.py` | — |
+| `chatd.py` | `subconscious/cortex/api.py` | - |
 | `background.py` | `subconscious/subcortex/tick.py` | `import background` shim |
 | `/etc/chatd/` | `/etc/subconscious/` | оба читаются |
 | `~/.local/share/chatd/` | `~/.local/share/subconscious/` | миграционный скрипт |
 | systemd `chatd.service` | `subconscious.service` | symlink |
 | systemd `chatd-tick.timer` | `subconscious-tick.timer` | symlink |
 | `/usr/local/bin/chatd-tick` | `/usr/local/bin/subconscious-tick` | symlink |
-| `chatd.service.txt` | `subconscious.service.example` | — |
+| `chatd.service.txt` | `subconscious.service.example` | - |
 | `/api/chat` и т.д. | **не меняются** | публичный API |
 
 ## Env backward compat
@@ -38,13 +38,13 @@
 
 Все существующие `os.environ.get("CHATD_...")` заменяются на `_env("...")`.
 
-Срок жизни shim'ов — до v2.0 (примерно год).
+Срок жизни shim'ов - до v2.0 (примерно год).
 
 ## Порядок работ
 
 1. **GitHub rename.** `chatd` → `subconscious-core`. Redirect появится автоматически.
 2. **Python package rename.** `chatd.py` → `subconscious/cortex/api.py`, `background.py` → `subconscious/subcortex/tick.py`.
-3. **Shim'ы.** `chatd.py` в корне содержит `from subconscious.cortex.api import app`, `background.py` — `from subconscious.subcortex.tick import *`.
+3. **Shim'ы.** `chatd.py` в корне содержит `from subconscious.cortex.api import app`, `background.py` - `from subconscious.subcortex.tick import *`.
 4. **Env helper.** `_env()` в config.py + замена по коду.
 5. **systemd units.** Новые файлы + symlinks для старых имён.
 6. **State dir migration.** Скрипт `subconscious migrate-state`, переносит `~/.local/share/chatd/` → `~/.local/share/subconscious/` (symlink на старое для совместимости).

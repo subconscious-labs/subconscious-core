@@ -1,4 +1,4 @@
-"""internal_tools.py — in-process tools exposed to the chat LLM.
+"""internal_tools.py - in-process tools exposed to the chat LLM.
 
 These are NOT MCP tools. They run in the same Python process as chatd and
 read/write the background ledger directly. The LLM sees them as regular
@@ -103,7 +103,7 @@ _SCHEMAS: List[Dict[str, Any]] = [
                     "based_on": {
                         "type": "string",
                         "description": (
-                            "Optional context — what prompted this goal "
+                            "Optional context - what prompted this goal "
                             "(user request, prior observation, etc.)."
                         ),
                     },
@@ -180,9 +180,9 @@ _SCHEMAS: List[Dict[str, Any]] = [
                 "Restart an MCP server. Graceful by default: close session, "
                 "SIGTERM, wait up to 5s, then SIGKILL if still alive. "
                 "force=true skips the graceful path and sends SIGKILL "
-                "immediately — last resort for hung servers.\n\n"
+                "immediately - last resort for hung servers.\n\n"
                 "Side effects: the server briefly disappears from the tool "
-                "list. Tool schema changes are NOT auto-applied — chatd "
+                "list. Tool schema changes are NOT auto-applied - chatd "
                 "restart is required if the server's tool set changed.\n\n"
                 "Chat-only. Not available in background mode."
             ),
@@ -210,16 +210,16 @@ _SCHEMAS: List[Dict[str, Any]] = [
                 "Ask a stdio MCP server to reload its configuration without "
                 "a full restart. Sends SIGHUP, waits 2 seconds, verifies the "
                 "server still responds.\n\n"
-                "IMPORTANT: many servers do not implement SIGHUP usefully — "
+                "IMPORTANT: many servers do not implement SIGHUP usefully - "
                 "some ignore it (nothing changes), some die on it (SIGHUP's "
                 "default action is termination). This tool detects both cases "
                 "and automatically restarts the server in response, so the "
                 "server is never left dead.\n\n"
                 "Possible outcomes:\n"
-                "  status=reloaded              — SIGHUP worked, config reloaded\n"
-                "  status=restarted_after_sighup — SIGHUP failed, server was "
+                "  status=reloaded               - SIGHUP worked, config reloaded\n"
+                "  status=restarted_after_sighup - SIGHUP failed, server was "
                 "restarted instead (config re-read from scratch)\n"
-                "  status=failed                — both failed, server may need "
+                "  status=failed                 - both failed, server may need "
                 "manual intervention\n\n"
                 "Chat-only. Not available in background mode."
             ),
@@ -285,7 +285,7 @@ def _acquire_ledger_lock(timeout_sec: float = 5.0):
     """Acquire TickLock with a short retry loop.
 
     Returns the lock on success, None if a tick is running. We intentionally
-    reuse TickLock — it already serializes run_tick, and one lock for
+    reuse TickLock - it already serializes run_tick, and one lock for
     "background state writes" is simpler than two.
     """
     import background
@@ -569,7 +569,7 @@ def _mcp_server_list(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _is_zombie_external(pid: int) -> bool:
-    """Same as mcp_client._is_zombie but local — avoid cross-module import."""
+    """Same as mcp_client._is_zombie but local - avoid cross-module import."""
     try:
         with open(f"/proc/{pid}/stat", "r") as f:
             stat = f.read()
@@ -630,7 +630,7 @@ def _mcp_server_reload(args: Dict[str, Any]) -> Dict[str, Any]:
     elif result.get("status") == "restarted_after_sighup":
         result["note"] = (
             "SIGHUP did not work (server either ignored it or died on it). "
-            "The server was restarted instead — configuration is now "
+            "The server was restarted instead - configuration is now "
             "re-read from scratch. Tool schemas are not auto-refreshed in "
             "chatd; restart chatd if the tool set changed."
         )

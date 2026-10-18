@@ -7,7 +7,7 @@ Emits normalized internal chunks (see backends.base docstring):
   {"model", "created_at"?, "message": {"role", "content", "thinking"?,
    "tool_calls"?}, "done", "done_reason"?, "usage"?}
 
-Ollama's native `message.thinking` is already the right name — passthrough.
+Ollama's native `message.thinking` is already the right name - passthrough.
 tool_calls are flattened from {function: {name, arguments}} to
 {id, name, arguments}.
 """
@@ -108,7 +108,7 @@ def _prepare_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     Ollama reads prior assistant turns as-is; it does not require
     tool_calls on historical assistant messages to be re-serialised in any
-    particular way — but we normalise anyway for round-trip safety.
+    particular way - but we normalise anyway for round-trip safety.
     """
     prepared = dict(payload)
     msgs_in = payload.get("messages") or []

@@ -146,7 +146,7 @@ def _kill_process(cmd: list[str]) -> None:
 def _wrap_with_pidfile(cmd: list[str], pidfile: Path) -> list[str]:
     """Wrap a command so the child writes its PID to `pidfile` before exec.
 
-    `exec "$@"` replaces the sh wrapper with the real command — same PID.
+    `exec "$@"` replaces the sh wrapper with the real command - same PID.
     The PID file therefore contains the real server process's PID, not the
     wrapper's.
     """
@@ -340,7 +340,7 @@ class MCPClient:
         Called from restart(). Safe to call on a live client.
         """
         with self._op_lock:
-            # Close the async stack first — this closes stdin, often
+            # Close the async stack first - this closes stdin, often
             # enough to make the child exit gracefully on its own.
             if self._stack and self._loop:
                 try:
@@ -419,7 +419,7 @@ class MCPClient:
         """Try SIGHUP; fall back to restart if the server dies or stops working.
 
         Many servers (Go binaries like lazy-mcp, time-mcp) either ignore
-        SIGHUP silently or die on it — SIGHUP's default action is termination
+        SIGHUP silently or die on it - SIGHUP's default action is termination
         unless a handler is installed. Even servers with a handler registered
         (visible in /proc/<pid>/status SigCgt) sometimes do nothing useful
         with it. Only the post-signal check is authoritative.
@@ -468,7 +468,7 @@ class MCPClient:
     def _restart_after_reload_failure(self, old_pid: int,
                                       reason: str) -> Dict[str, Any]:
         """Restart the client after a failed SIGHUP. Caller holds _op_lock."""
-        # If the process is dead, skip the graceful path — there's nothing
+        # If the process is dead, skip the graceful path - there's nothing
         # left to be graceful about. If it's still alive (SIGHUP was
         # ignored, nothing changed), we still need a real restart to pick
         # up a new config, so graceful stop is fine.

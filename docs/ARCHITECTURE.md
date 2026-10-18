@@ -1,54 +1,54 @@
-# subconscious — архитектура
+# subconscious - архитектура
 
 ## Четыре зоны
 
-Один Python-пакет `subconscious`, четыре подпакета. Каждый — одна
+Один Python-пакет `subconscious`, четыре подпакета. Каждый - одна
 ответственность.
 
-### core/ — данные и состояние
+### core/ - данные и состояние
 
 Что хранится, где, в каком формате. Не логика.
 
-- `memory/` — KG (SQLite), vector store (sqlite-vec), identity, layers.
-- `rag.py` — RAG-sidecar (L1.5).
-- `session.py` — сессии чата (JSONL chatlog + JSON markers).
-- `ledger.py` — goals.json + goals.archive.jsonl + journal.jsonl.
-- `budget.py` — budget.json + new_goals_counter.json.
-- `config.py` — layered конфиг (env > file > default).
+- `memory/` - KG (SQLite), vector store (sqlite-vec), identity, layers.
+- `rag.py` - RAG-sidecar (L1.5).
+- `session.py` - сессии чата (JSONL chatlog + JSON markers).
+- `ledger.py` - goals.json + goals.archive.jsonl + journal.jsonl.
+- `budget.py` - budget.json + new_goals_counter.json.
+- `config.py` - layered конфиг (env > file > default).
 
-### cortex/ — интерфейсы
+### cortex/ - интерфейсы
 
 Кто разговаривает с внешним миром. Всё, что видит пользователь или
 другой агент.
 
-- `api.py` — Flask app, `/api/chat`, `/api/tick`, `/api/event`.
-- `a2a.py` — Agent Card, Task mapping (PR D).
-- `cli.py` — команды `subconscious init`, `subconscious tick`, `subconscious status`.
-- `event.py` — обработчик входящих событий.
+- `api.py` - Flask app, `/api/chat`, `/api/tick`, `/api/event`.
+- `a2a.py` - Agent Card, Task mapping (PR D).
+- `cli.py` - команды `subconscious init`, `subconscious tick`, `subconscious status`.
+- `event.py` - обработчик входящих событий.
 
-**Чат — это cortex, не ядро.** Чат использует core, thalamus, subcortex,
+**Чат - это cortex, не ядро.** Чат использует core, thalamus, subcortex,
 но сам по себе не суть проекта.
 
-### thalamus/ — связки
+### thalamus/ - связки
 
 Роутер между нами и внешним миром.
 
-- `backends/` — Ollama, OpenRouter, DeepSeek, ONNX.
-- `mcp/client.py` — stdio-клиент к MCP-серверам.
-- `mcp/router.py` — namespacing, фильтры, категории инструментов.
-- `mcp/config.py` — загрузчик `mcp_servers.yaml`.
-- `tools.py` — фильтр «что видит chat / executor / exploratory».
+- `backends/` - Ollama, OpenRouter, DeepSeek, ONNX.
+- `mcp/client.py` - stdio-клиент к MCP-серверам.
+- `mcp/router.py` - namespacing, фильтры, категории инструментов.
+- `mcp/config.py` - загрузчик `mcp_servers.yaml`.
+- `tools.py` - фильтр «что видит chat / executor / exploratory».
 
-### subcortex/ — фоновое мышление
+### subcortex/ - фоновое мышление
 
 Главная фича. То, чего нет в других chatd-подобных проектах.
 
-- `tick.py` — orchestration одного тика.
-- `planner.py` — выбор цели / создание / skip.
-- `executor.py` — tool loop выполнения цели.
-- `reflector.py` — разбор blocked-целей.
-- `assessor.py` — оценка done-целей (PR D).
-- `prompts/` — planner.txt, executor.txt, exploratory.txt, reflector.txt.
+- `tick.py` - orchestration одного тика.
+- `planner.py` - выбор цели / создание / skip.
+- `executor.py` - tool loop выполнения цели.
+- `reflector.py` - разбор blocked-целей.
+- `assessor.py` - оценка done-целей (PR D).
+- `prompts/` - planner.txt, executor.txt, exploratory.txt, reflector.txt.
 
 ## Поток данных
 
@@ -86,18 +86,18 @@ core      →  ничего внутри проекта
 ```
 
 **Никаких обратных зависимостей.** core не знает про subcortex. thalamus
-не знает про cortex. Если появляется обратная — это ошибка дизайна.
+не знает про cortex. Если появляется обратная - это ошибка дизайна.
 
 ## State
 
-Всё мутабельное — в `$SUBCONSCIOUS_STATE_DIR` (по умолчанию
+Всё мутабельное - в `$SUBCONSCIOUS_STATE_DIR` (по умолчанию
 `~/.local/share/subconscious/`):
 
-- `bg/` — цели, journal, budget, seed_rotation, new_goals_counter.
-- `sessions/` — JSONL чатлоги.
-- `rag.sqlite3` — RAG-индекс.
-- `kg.sqlite3` — свой KG (PR E).
-- `vectors.sqlite3` — свой vector store (PR E).
+- `bg/` - цели, journal, budget, seed_rotation, new_goals_counter.
+- `sessions/` - JSONL чатлоги.
+- `rag.sqlite3` - RAG-индекс.
+- `kg.sqlite3` - свой KG (PR E).
+- `vectors.sqlite3` - свой vector store (PR E).
 
 **Никогда** в `/opt/<svc>/`, никогда в home сервиса.
 ```
@@ -153,8 +153,8 @@ Code and state are separated.
 
 Two transports are supported, chosen by env prefix:
 
-- `SUBCONSCIOUS_MCP_STDIO_<NAME>=<command>` — spawn the MCP server as a
+- `SUBCONSCIOUS_MCP_STDIO_<NAME>=<command>` - spawn the MCP server as a
   subprocess, talk over stdin/stdout. This is the default for local tools.
-- `SUBCONSCIOUS_MCP_HTTP_<NAME>_URL=<url>` (+ optional `_TOKEN=<bearer>`) —
+- `SUBCONSCIOUS_MCP_HTTP_<NAME>_URL=<url>` (+ optional `_TOKEN=<bearer>`) -
   connect to a remote MCP server over HTTP. Used for services that already
   run as daemons (e.g. mempalace in Docker).
