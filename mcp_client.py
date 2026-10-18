@@ -110,8 +110,18 @@ def discover_mcp_servers() -> dict[str, dict]:
 
 
 def _kill_process(cmd: list[str]) -> None:
-    """Best-effort: find and SIGKILL child processes matching cmd.
-    Only meaningful for stdio transports.
+    """Best-effort: SIGKILL a hung stdio MCP server by matching its command.
+
+    Triggered on call_tool/list_tools timeout. Kills the ENTIRE stdio
+    process, which means all of that server's backends (in the case of a
+    proxy like lazy-mcp) disappear until the next mcp_server_restart.
+    This is by design: if the transport is stuck for 60s, the connection
+    is unusable and continuing to use it produces only cryptic errors.
+
+    Callers should be aware that a single slow operation through a proxy
+    takes down every backend that proxy manages. Do not route long-running
+    operations (grep -r, full-catalog dumps) through a shared MCP proxy;
+    use the specific backend's tool directly.
     """
     if not cmd:
         return
@@ -405,34 +415,76 @@ class MCPClient:
                 log.error("[mcp] %s: restart failed: %s", self.name, e)
                 return False
 
-    def reload(self, wait: float = 2.0) -> bool:
-        """Send SIGHUP and verify the client still works after `wait` seconds.
+    def reload(self, wait: float = 2.0) -> Dict[str, Any]:
+        """Try SIGHUP; fall back to restart if the server dies or stops working.
 
-        Returns True on success. Returns False if the signal fails, the
-        process dies, or list_tools stops working — caller should fall
-        back to restart().
+        Many servers (Go binaries like lazy-mcp, time-mcp) either ignore
+        SIGHUP silently or die on it — SIGHUP's default action is termination
+        unless a handler is installed. Even servers with a handler registered
+        (visible in /proc/<pid>/status SigCgt) sometimes do nothing useful
+        with it. Only the post-signal check is authoritative.
+
+        Returns a dict describing what actually happened:
+          {"status": "reloaded", "pid": <pid>}
+          {"status": "restarted_after_sighup",
+           "pid": <new_pid>,
+           "reason": "process died" | "list_tools failed" | "process gone"}
+          {"status": "failed", "error": "..."}
         """
         if self.transport != "stdio":
-            log.warning("[mcp] %s: reload not supported for %s",
-                        self.name, self.transport)
-            return False
+            return {"status": "failed",
+                    "error": f"reload not supported for {self.transport}"}
         if not self._pid:
-            return False
+            return {"status": "failed", "error": "no pid captured"}
 
         with self._op_lock:
+            old_pid = self._pid
+
             if not self.signal(signal.SIGHUP):
-                return False
+                reason = "process gone before signal"
+                log.warning("[mcp] %s: %s, falling back to restart",
+                            self.name, reason)
+                return self._restart_after_reload_failure(old_pid, reason)
+
             time.sleep(wait)
+
             if not self._pid or _is_zombie(self._pid):
-                log.warning("[mcp] %s: process died after SIGHUP", self.name)
-                return False
+                reason = "process died after SIGHUP"
+                log.warning("[mcp] %s: %s, falling back to restart",
+                            self.name, reason)
+                return self._restart_after_reload_failure(old_pid, reason)
+
             try:
                 tools = self.list_tools()
-                log.info("[mcp] %s: reload ok (%d tools)", self.name, len(tools))
-                return True
+                log.info("[mcp] %s: SIGHUP ok, still serving %d tools",
+                         self.name, len(tools))
+                return {"status": "reloaded", "pid": self._pid}
             except Exception as e:
-                log.warning("[mcp] %s: reload failed: %s", self.name, e)
-                return False
+                reason = f"list_tools failed after SIGHUP: {e}"
+                log.warning("[mcp] %s: %s, falling back to restart",
+                            self.name, reason)
+                return self._restart_after_reload_failure(old_pid, reason)
+
+    def _restart_after_reload_failure(self, old_pid: int,
+                                      reason: str) -> Dict[str, Any]:
+        """Restart the client after a failed SIGHUP. Caller holds _op_lock."""
+        # If the process is dead, skip the graceful path — there's nothing
+        # left to be graceful about. If it's still alive (SIGHUP was
+        # ignored, nothing changed), we still need a real restart to pick
+        # up a new config, so graceful stop is fine.
+        force = not self._pid or _is_zombie(self._pid)
+        ok = self.restart(force=force)
+        if not ok:
+            return {"status": "failed",
+                    "error": f"restart failed after: {reason}"}
+        log.info("[mcp] %s: restarted after failed reload (%s), new pid=%s",
+                 self.name, reason, self._pid)
+        return {
+            "status": "restarted_after_sighup",
+            "pid": self._pid,
+            "reason": reason,
+            "old_pid": old_pid,
+        }
 
     def _run(self, coro, timeout: float):
         if self._loop is None or self._session is None:

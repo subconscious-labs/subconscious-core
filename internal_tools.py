@@ -206,13 +206,20 @@ _SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "mcp_server_reload",
             "description": (
-                "Send SIGHUP to a stdio MCP server and verify it still "
-                "responds. Asks the server to reload its configuration "
-                "without a full restart.\n\n"
-                "Not all servers implement SIGHUP: some ignore it (server "
-                "stays up, nothing changes), some exit. Falls back to a "
-                "clear error if the process dies or stops responding — "
-                "use mcp_server_restart in that case.\n\n"
+                "Ask a stdio MCP server to reload its configuration without "
+                "a full restart. Sends SIGHUP, waits 2 seconds, verifies the "
+                "server still responds.\n\n"
+                "IMPORTANT: many servers do not implement SIGHUP usefully — "
+                "some ignore it (nothing changes), some die on it (SIGHUP's "
+                "default action is termination). This tool detects both cases "
+                "and automatically restarts the server in response, so the "
+                "server is never left dead.\n\n"
+                "Possible outcomes:\n"
+                "  status=reloaded              — SIGHUP worked, config reloaded\n"
+                "  status=restarted_after_sighup — SIGHUP failed, server was "
+                "restarted instead (config re-read from scratch)\n"
+                "  status=failed                — both failed, server may need "
+                "manual intervention\n\n"
                 "Chat-only. Not available in background mode."
             ),
             "parameters": {
@@ -523,20 +530,52 @@ def _find_mcp_client(name: str):
 
 def _mcp_server_list(args: Dict[str, Any]) -> Dict[str, Any]:
     import chatd
+
     clients = getattr(chatd, "_MCP_CLIENTS", [])
     servers = []
     for c in clients:
         entry: Dict[str, Any] = {
             "name": c.name,
             "transport": c.transport,
-            "pid": getattr(c, "_pid", None),
         }
+        pid = getattr(c, "_pid", None)
         if c.transport == "stdio":
             entry["command"] = c.cmd
+            entry["pid"] = pid
+            if pid:
+                # Liveness check: the stored _pid can be stale if the
+                # process died outside our control (SIGHUP, OOM, kill).
+                try:
+                    os.kill(pid, 0)
+                    entry["status"] = "zombie" if _is_zombie_external(pid) else "alive"
+                except ProcessLookupError:
+                    entry["status"] = "dead"
+                except PermissionError:
+                    entry["status"] = "unknown (no permission to probe)"
+                except Exception as e:
+                    entry["status"] = f"unknown ({e})"
+            else:
+                entry["status"] = "no_pid"
         else:
             entry["url"] = c.url
+            entry["status"] = "remote"
         servers.append(entry)
     return {"count": len(servers), "servers": servers}
+
+
+def _is_zombie_external(pid: int) -> bool:
+    """Same as mcp_client._is_zombie but local — avoid cross-module import."""
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat = f.read()
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+    idx = stat.rfind(")")
+    if idx < 0 or idx + 2 >= len(stat):
+        return False
+    return stat[idx + 2] == "Z"
 
 
 def _mcp_server_restart(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -575,16 +614,22 @@ def _mcp_server_reload(args: Dict[str, Any]) -> Dict[str, Any]:
     if client.transport != "stdio":
         return {"error": f"reload not supported for {client.transport} transport"}
 
-    ok = client.reload()
-    if ok:
-        return {"status": "reloaded", "name": name,
-                "pid": getattr(client, "_pid", None)}
-    return {
-        "status": "reload_failed",
-        "name": name,
-        "hint": ("SIGHUP was ignored, the process died, or list_tools "
-                 "failed after reload. Try mcp_server_restart."),
-    }
+    result = client.reload()
+    result["name"] = name
+    if result.get("status") == "failed":
+        result["hint"] = (
+            "Reload failed AND automatic restart failed. The server may be "
+            "in an unrecoverable state. Try mcp_server_restart manually "
+            "with force=true."
+        )
+    elif result.get("status") == "restarted_after_sighup":
+        result["note"] = (
+            "SIGHUP did not work (server either ignored it or died on it). "
+            "The server was restarted instead — configuration is now "
+            "re-read from scratch. Tool schemas are not auto-refreshed in "
+            "chatd; restart chatd if the tool set changed."
+        )
+    return result
 
 
 _DISPATCH = {
