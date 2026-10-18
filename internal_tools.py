@@ -554,7 +554,11 @@ def _mcp_server_list(args: Dict[str, Any]) -> Dict[str, Any]:
                 except PermissionError:
                     entry["status"] = "unknown (no permission to probe)"
                 except Exception as e:
-                    entry["status"] = f"unknown ({e})"
+                    log.warning(
+                        "[internal] liveness probe for %s pid %s failed: %s: %s",
+                        c.name, pid, type(e).__name__, e,
+                    )
+                    entry["status"] = f"unknown ({type(e).__name__}: {e})"
             else:
                 entry["status"] = "no_pid"
         else:
