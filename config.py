@@ -82,7 +82,7 @@ MEMPALACE_WRITE_TOOLS: Set[str] = {
 }
 
 # ── Session ───────────────────────────────────────────────────────────────────
-CHATD_SESSION_DIR: str = _env("SESSION_DIR", "~/.local/share/chatd/sessions")
+SESSION_DIR: str = _env("SESSION_DIR", "~/.local/share/chatd/sessions")
 
 # ── External RAG store ────────────────────────────────────────────────────────
 RAG_ENABLED: bool = _env("RAG_ENABLED", "true").lower() == "true"
@@ -109,10 +109,10 @@ OPENROUTER_API_MODELS: List[str] = [
 # Optional shared secret for /api/event.
 # If set, caller must pass Authorization: Bearer <token>.
 # If empty - endpoint is open (only for trusted internal networks).
-CHATD_EVENT_TOKEN: str = _env("EVENT_TOKEN", "")
+EVENT_TOKEN: str = _env("EVENT_TOKEN", "")
 
 # Model used to process incoming events (can differ from chat model).
-CHATD_EVENT_MODEL: str = _env("EVENT_MODEL", "")
+EVENT_MODEL: str = _env("EVENT_MODEL", "")
 
 # ── Tool description overrides ────────────────────────────────────────────────
 TOOL_OVERRIDE: bool = _env("TOOL_OVERRIDE", "false").lower() == "true"
@@ -318,7 +318,7 @@ CHAT_TOOL_RESULT_MAX_CHARS: int = int(
 #   1. prompts/<name>.txt                     (bundled default, in repo)
 #   2. /etc/chatd/prompts/<name>.txt          (system override)
 #   3. ~/.config/chatd/prompts/<name>.txt     (user override)
-#   4. CHATD_BG_PROMPT_<NAME> env var         (runtime override)
+#   4. SUBCONSCIOUS_BG_PROMPT_<NAME> env var  (runtime override)
 #
 # Later sources override earlier ones. Empty result means "use code default",
 # which is the same as the bundled file at the time of release.
@@ -339,6 +339,23 @@ def _load_bg_prompt(name: str) -> str:
                 continue
     return _env(f"BG_PROMPT_{name.upper()}", "")
 
+
+# Wake-up mode for background phases.
+#   "none"     — no wake-up block at all (default for planner/reflector)
+#   "identity" — identity.txt only, no KG snippet
+#   "full"     — full wake-up (identity + KG)
+#
+# The background worker rarely needs the model's identity/KG context:
+# planner sees observations and goals, reflector sees one goal's history.
+# Wake-up is ~10k chars per LLM call; stripping it saves 15–20% of
+# tokens on every tick.
+BG_WAKEUP_MODE: str = _env("BG_WAKEUP_MODE", "none")
+
+# Per-phase overrides. Empty string means "use BG_WAKEUP_MODE".
+BG_WAKEUP_MODE_PLANNER: str = _env("BG_WAKEUP_MODE_PLANNER", "")
+BG_WAKEUP_MODE_EXECUTOR: str = _env("BG_WAKEUP_MODE_EXECUTOR", "")
+BG_WAKEUP_MODE_REFLECTOR: str = _env("BG_WAKEUP_MODE_REFLECTOR", "")
+BG_WAKEUP_MODE_EXPLORATORY: str = _env("BG_WAKEUP_MODE_EXPLORATORY", "")
 
 BG_PROMPT_PLANNER: str = _load_bg_prompt("planner")
 BG_PROMPT_EXECUTOR: str = _load_bg_prompt("executor")

@@ -5,7 +5,7 @@ Phases (one per tick):
   Executor   model with tools; runs the selected goal (tool loop)
   Reflector  model without tools; only on blocked goals: retry | cancel | keep
 
-State lives entirely in $CHATD_BG_STATE_DIR:
+State lives entirely in $SUBCONSCIOUS_BG_STATE_DIR:
   goals.json     - ledger (atomic rewrite)
   budget.json    - daily token/time counters
   journal.jsonl  - append-only tick log
@@ -707,7 +707,41 @@ def _llm_call(
     }
 
 
-def _system_block() -> str:
+def _system_block(phase: str) -> str:
+    """Return the wake-up block appropriate for a phase.
+
+    phase is one of: "planner", "executor", "reflector", "exploratory".
+
+    Mode resolution:
+      1. Per-phase override (BG_WAKEUP_MODE_<PHASE>) if non-empty.
+      2. Global default (BG_WAKEUP_MODE).
+      3. "none" if both are empty.
+
+    Returns "" when the mode is "none", the caller should skip the
+    system message entirely.
+    """
+    from config import (
+        BG_WAKEUP_MODE,
+        BG_WAKEUP_MODE_PLANNER,
+        BG_WAKEUP_MODE_EXECUTOR,
+        BG_WAKEUP_MODE_REFLECTOR,
+        BG_WAKEUP_MODE_EXPLORATORY,
+    )
+
+    per_phase = {
+        "planner":     BG_WAKEUP_MODE_PLANNER,
+        "executor":    BG_WAKEUP_MODE_EXECUTOR,
+        "reflector":   BG_WAKEUP_MODE_REFLECTOR,
+        "exploratory": BG_WAKEUP_MODE_EXPLORATORY,
+    }
+    mode = (per_phase.get(phase) or BG_WAKEUP_MODE or "none").lower()
+
+    if mode == "none":
+        return ""
+    if mode == "identity":
+        import memory
+        return memory.wake_up_identity_only()
+    # "full" or anything unrecognised — fall back to full
     import memory
     return memory.wake_up()
 
@@ -902,11 +936,12 @@ def _planner() -> Dict[str, Any]:
         f"Return your JSON decision."
     )
 
-    messages = [
-        {"role": "system", "content": _system_block()},
-        {"role": "system", "content": _PLANNER_INSTRUCTIONS},
-        {"role": "user", "content": user_text},
-    ]
+    messages: List[Dict[str, Any]] = []
+    wakeup = _system_block("planner")
+    if wakeup:
+        messages.append({"role": "system", "content": wakeup})
+    messages.append({"role": "system", "content": _PLANNER_INSTRUCTIONS})
+    messages.append({"role": "user", "content": user_text})
 
     resp = _llm_call(messages, model, tools=None,
                      num_predict=BG_NUM_PREDICT)
@@ -1190,11 +1225,12 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         f"summary as instructed."
     )
 
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": _system_block()},
-        {"role": "system", "content": _EXECUTOR_JSON_INSTRUCTIONS},
-        {"role": "user", "content": user_text},
-    ]
+    messages: List[Dict[str, Any]] = []
+    wakeup = _system_block("executor")
+    if wakeup:
+        messages.append({"role": "system", "content": wakeup})
+    messages.append({"role": "system", "content": _EXECUTOR_JSON_INSTRUCTIONS})
+    messages.append({"role": "user", "content": user_text})
 
     tokens_total = 0
     tool_calls_made = 0
@@ -1294,11 +1330,12 @@ def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
         f"Return your JSON decision."
     )
 
-    messages = [
-        {"role": "system", "content": _system_block()},
-        {"role": "system", "content": _REFLECTOR_INSTRUCTIONS},
-        {"role": "user", "content": user_text},
-    ]
+    messages: List[Dict[str, Any]] = []
+    wakeup = _system_block("reflector")
+    if wakeup:
+        messages.append({"role": "system", "content": wakeup})
+    messages.append({"role": "system", "content": _REFLECTOR_INSTRUCTIONS})
+    messages.append({"role": "user", "content": user_text})
 
     try:
         resp = _llm_call(messages, model, tools=None, num_predict=BG_NUM_PREDICT)

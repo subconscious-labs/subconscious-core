@@ -9,7 +9,7 @@ the current user message.
 L1.5 is always injected into the system prompt alongside KG recall.
 It does not replace or modify any mempalace layer.
 
-Set CHATD_RAG_ENABLED=false to disable the layer entirely without
+Set SUBCONSCIOUS_RAG_ENABLED=false to disable the layer entirely without
 touching any other RAG settings.
 """
 import json
@@ -48,7 +48,7 @@ def _connect() -> sqlite3.Connection:
 def init() -> None:
     """Initialise the L1.5 external RAG store (chatd-owned, separate from mempalace)."""
     if not RAG_ENABLED:
-        log.info("RAG: disabled via CHATD_RAG_ENABLED")
+        log.info("RAG: disabled via SUBCONSCIOUS_RAG_ENABLED")
         return
     conn = _connect()
     try:

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """internal_tools.py — in-process tools exposed to the chat LLM.
 
 These are NOT MCP tools. They run in the same Python process as chatd and
@@ -158,6 +157,73 @@ _SCHEMAS: List[Dict[str, Any]] = [
                         "description": "How many entries. Default 20, max 100.",
                     },
                 },
+            },
+        },
+    },
+        {
+        "type": "function",
+        "function": {
+            "name": "mcp_server_list",
+            "description": (
+                "List registered MCP servers with transport, PID, and "
+                "command. Use before restart/reload to see current state."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_server_restart",
+            "description": (
+                "Restart an MCP server. Graceful by default: close session, "
+                "SIGTERM, wait up to 5s, then SIGKILL if still alive. "
+                "force=true skips the graceful path and sends SIGKILL "
+                "immediately — last resort for hung servers.\n\n"
+                "Side effects: the server briefly disappears from the tool "
+                "list. Tool schema changes are NOT auto-applied — chatd "
+                "restart is required if the server's tool set changed.\n\n"
+                "Chat-only. Not available in background mode."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "MCP server name (from mcp_server_list)",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "SIGKILL immediately, skip graceful path",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_server_reload",
+            "description": (
+                "Send SIGHUP to a stdio MCP server and verify it still "
+                "responds. Asks the server to reload its configuration "
+                "without a full restart.\n\n"
+                "Not all servers implement SIGHUP: some ignore it (server "
+                "stays up, nothing changes), some exit. Falls back to a "
+                "clear error if the process dies or stops responding — "
+                "use mcp_server_restart in that case.\n\n"
+                "Chat-only. Not available in background mode."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "MCP server name",
+                    },
+                },
+                "required": ["name"],
             },
         },
     },
@@ -447,12 +513,89 @@ def _journal_tail(args: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── dispatcher ────────────────────────────────────────────────────────────────
 
+def _find_mcp_client(name: str):
+    import chatd
+    for client in getattr(chatd, "_MCP_CLIENTS", []):
+        if client.name == name:
+            return client
+    return None
+
+
+def _mcp_server_list(args: Dict[str, Any]) -> Dict[str, Any]:
+    import chatd
+    clients = getattr(chatd, "_MCP_CLIENTS", [])
+    servers = []
+    for c in clients:
+        entry: Dict[str, Any] = {
+            "name": c.name,
+            "transport": c.transport,
+            "pid": getattr(c, "_pid", None),
+        }
+        if c.transport == "stdio":
+            entry["command"] = c.cmd
+        else:
+            entry["url"] = c.url
+        servers.append(entry)
+    return {"count": len(servers), "servers": servers}
+
+
+def _mcp_server_restart(args: Dict[str, Any]) -> Dict[str, Any]:
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "name is required"}
+    force = bool(args.get("force", False))
+
+    client = _find_mcp_client(name)
+    if client is None:
+        return {"error": f"MCP server not found: {name}"}
+
+    ok = client.restart(force=force)
+    if ok:
+        return {
+            "status": "restarted",
+            "name": name,
+            "force": force,
+            "pid": getattr(client, "_pid", None),
+            "note": (
+                "Tool schemas are not auto-refreshed. If the server's tool "
+                "set changed, restart chatd to rebuild the registry."
+            ),
+        }
+    return {"error": f"restart failed for {name}"}
+
+
+def _mcp_server_reload(args: Dict[str, Any]) -> Dict[str, Any]:
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "name is required"}
+
+    client = _find_mcp_client(name)
+    if client is None:
+        return {"error": f"MCP server not found: {name}"}
+    if client.transport != "stdio":
+        return {"error": f"reload not supported for {client.transport} transport"}
+
+    ok = client.reload()
+    if ok:
+        return {"status": "reloaded", "name": name,
+                "pid": getattr(client, "_pid", None)}
+    return {
+        "status": "reload_failed",
+        "name": name,
+        "hint": ("SIGHUP was ignored, the process died, or list_tools "
+                 "failed after reload. Try mcp_server_restart."),
+    }
+
+
 _DISPATCH = {
     "subcortex_goals_list":   _list_goals,
     "subcortex_goals_get":    _get_goal,
     "subcortex_goals_create": _create_goal,
     "subcortex_goals_cancel": _cancel_goal,
     "subcortex_journal_tail": _journal_tail,
+    "mcp_server_list":        _mcp_server_list,
+    "mcp_server_restart":     _mcp_server_restart,
+    "mcp_server_reload":      _mcp_server_reload,
 }
 
 

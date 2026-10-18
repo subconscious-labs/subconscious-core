@@ -21,11 +21,11 @@ For full LLM inference via ONNX, consider:
            ./models/all-MiniLM-L6-v2/
 
   3. Set environment variables:
-       CHATD_ONNX_MODEL_DIR=./models/all-MiniLM-L6-v2
-       CHATD_ONNX_TOKENIZER_DIR=./models/all-MiniLM-L6-v2
+       SUBCONSCIOUS_ONNX_MODEL_DIR=./models/all-MiniLM-L6-v2
+       SUBCONSCIOUS_ONNX_TOKENIZER_DIR=./models/all-MiniLM-L6-v2
 
   4. Enable as the RAG embed backend:
-       CHATD_RAG_BACKEND=onnx
+       SUBCONSCIOUS_RAG_BACKEND=onnx
 
   5. For chat: not supported by default. Implement chat_stream / chat_sync
      below if your ONNX model is a seq2seq or decoder-only LLM.
@@ -37,12 +37,12 @@ import logging
 import os
 from typing import Any, Dict, Generator, List
 
+from config import _env
+
 log = logging.getLogger("chatd.backends.onnx")
 
-ONNX_MODEL_DIR: str = os.environ.get("CHATD_ONNX_MODEL_DIR", "")
-ONNX_TOKENIZER_DIR: str = os.environ.get(
-    "CHATD_ONNX_TOKENIZER_DIR", ONNX_MODEL_DIR
-)
+ONNX_MODEL_DIR: str = _env("ONNX_MODEL_DIR", "")
+ONNX_TOKENIZER_DIR: str = _env("ONNX_TOKENIZER_DIR", ONNX_MODEL_DIR)
 
 _session = None
 _tokenizer = None

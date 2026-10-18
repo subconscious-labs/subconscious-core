@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
-from config import CHATD_SESSION_DIR
+from config import SESSION_DIR
 
 log = logging.getLogger("chatd.session")
 
@@ -53,7 +53,7 @@ class Session:
     # ── persistence ──────────────────────────────────────────────────────────
 
     def _dir(self) -> Path:
-        d = Path(os.path.expanduser(CHATD_SESSION_DIR))
+        d = Path(os.path.expanduser(SESSION_DIR))
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -98,7 +98,7 @@ class Session:
     @classmethod
     def load(cls, session_id: str) -> "Session":
         """Load session from disk marker, or return a blank one."""
-        path = Path(os.path.expanduser(CHATD_SESSION_DIR)) / f"{session_id}.json"
+        path = Path(os.path.expanduser(SESSION_DIR)) / f"{session_id}.json"
         if path.exists():
             log.info("[session:%s] loaded from %s", session_id, path)
         else:

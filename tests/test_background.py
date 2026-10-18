@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 @pytest.fixture()
 def bg(tmp_path, monkeypatch):
     """Import background with isolated state dir."""
-    monkeypatch.setenv("CHATD_BG_STATE_DIR", str(tmp_path / "bg"))
+    monkeypatch.setenv("SUBCONSCIOUS_BG_STATE_DIR", str(tmp_path / "bg"))
     for mod in list(sys.modules):
         if mod in ("background", "config"):
             del sys.modules[mod]

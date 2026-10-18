@@ -6,7 +6,7 @@ Layered memory model:
   L1   mempalace : Essential Story (wake-up context) — always loaded
   L1.5 chatd     : request-scoped sidecar — RAG recall (KG recall removed)
                    injected per request — always loaded
-                   (disable with CHATD_LAYER_15_ENABLED=false)
+                   (disable with SUBCONSCIOUS_LAYER_15_ENABLED=false)
   L2   mempalace : Room Recall (filtered retrieval) — when topic comes up
   L3   mempalace : Deep Search (full semantic query) — when explicitly asked
 
@@ -99,10 +99,21 @@ def wake_up() -> str:
     """Assemble the always-loaded system-prompt block (L0 + L1)."""
     return _wakeup_cached()
 
+@functools.lru_cache(maxsize=1)
+def _identity_only_cached() -> str:
+    return _read_identity()
+
+
+def wake_up_identity_only() -> str:
+    """Identity block without KG snippet. For phases that only need the
+    project's self-description, not its knowledge graph."""
+    return _identity_only_cached()
+
 
 def invalidate() -> None:
-    """Clear the wake-up cache. Called after mempalace write operations."""
+    """Clear the wake-up caches. Called after mempalace write operations."""
     _wakeup_cached.cache_clear()
+    _identity_only_cached.cache_clear()
     log.info("FastMemory: cache invalidated")
 
 

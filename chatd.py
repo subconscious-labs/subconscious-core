@@ -32,8 +32,8 @@ from config import (
     TOOL_OVERRIDE,
     TOOL_DESCRIPTION_OVERRIDES,
     CHAT_TOOL_RESULT_MAX_CHARS,
-    CHATD_EVENT_TOKEN,
-    CHATD_EVENT_MODEL,
+    EVENT_TOKEN,
+    EVENT_MODEL,
     OPENROUTER_API_MODELS,
     DEEPSEEK_API,
     DEEPSEEK_API_MODELS,
@@ -250,14 +250,14 @@ def _last_user_text(messages: List[Dict]) -> str:
 
 
 def _check_event_token() -> Optional[Tuple[Response, int]]:
-    """Return (Response, status) tuple if CHATD_EVENT_TOKEN is set and Bearer doesn't match."""
-    if not CHATD_EVENT_TOKEN:
+    """Return (Response, status) tuple if SUBCONSCIOUS_EVENT_TOKEN is set and Bearer doesn't match."""
+    if not EVENT_TOKEN:
         return None
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return jsonify({"error": "missing Authorization header"}), 401
     token = auth.removeprefix("Bearer ").strip()
-    if token != CHATD_EVENT_TOKEN:
+    if token != EVENT_TOKEN:
         return jsonify({"error": "invalid token"}), 401
     return None
 
@@ -1539,7 +1539,7 @@ def system_event():
     else:
         event_payload = {k: v for k, v in ev.items()
                          if k not in ("type", "source", "model", "options")}
-    model   = ev.get("model") or CHATD_EVENT_MODEL or "qwen3:8b"
+    model   = ev.get("model") or EVENT_MODEL or "qwen3:8b"
     options = merge_options(ev.get("options"))
 
     log.info(
@@ -1580,8 +1580,8 @@ def bg_tick():
     """Background thinking trigger (single-turn preview).
 
     Returns:
-      404 - background disabled (CHATD_BG_ENABLED=false)
-      401 - CHATD_BG_TOKEN set and bearer doesn't match
+      404 - background disabled (SUBCONSCIOUS_BG_ENABLED=false)
+      401 - SUBCONSCIOUS_BG_TOKEN set and bearer doesn't match
       200 - {ok, req_id, result}
       500 - internal error inside background.run_tick
     """
