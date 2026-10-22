@@ -193,6 +193,11 @@ def make_done_chunk(
         obj["prompt_eval_count"] = prompt_tokens
         obj["eval_count"] = completion_tokens
 
+        details = usage.get("completion_tokens_details") or {}
+        r_tokens = details.get("reasoning_tokens", 0)
+        if r_tokens:
+            obj["reasoning_tokens"] = r_tokens
+
         obj["usage"] = usage
 
         if not durations:

@@ -210,15 +210,20 @@ def _sse_to_ndjson(response, model: str) -> Generator[bytes, None, None]:
             if tc_acc:
                 out["message"]["tool_calls"] = _finalise_tc(tc_acc)
             if usage_acc:
+                r_tokens = int(
+                    (usage_acc.get("completion_tokens_details") or {})
+                    .get("reasoning_tokens") or 0
+                )
                 out["usage"] = {
                     "prompt_tokens":     int(usage_acc.get("prompt_tokens") or 0),
                     "completion_tokens": int(usage_acc.get("completion_tokens") or 0),
-                    "reasoning_tokens":  int(
-                        (usage_acc.get("completion_tokens_details") or {})
-                        .get("reasoning_tokens") or 0
-                    ),
                     "cache_hit_tokens":  int(usage_acc.get("prompt_cache_hit_tokens") or 0),
                     "cache_miss_tokens": int(usage_acc.get("prompt_cache_miss_tokens") or 0),
+                    "completion_tokens_details": {
+                        "reasoning_tokens": r_tokens,
+                        "accepted_prediction_tokens": 0,
+                        "rejected_prediction_tokens": 0,
+                    },
                 }
                 log.info(
                     "[deepseek stream] prompt_tokens=%s completion_tokens=%s "
