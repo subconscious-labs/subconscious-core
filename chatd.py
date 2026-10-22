@@ -135,20 +135,20 @@ def make_keepalive(model: str) -> bytes:
     return make_chunk(model, "")
 
 
-def make_event_chunk(
-    model: str,
-    event_type: str,
-    payload: Dict[str, Any],
-) -> bytes:
-    """Typed event chunk. Clients MUST NOT append to message history."""
-    obj: Dict[str, Any] = {
-        "model":      model,
-        "created_at": now_iso(),
-        "message":    {"role": "assistant", "content": ""},
-        "event":      {"type": event_type, **payload},
-        "done":       False,
-    }
-    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+# def make_event_chunk(
+#     model: str,
+#     event_type: str,
+#     payload: Dict[str, Any],
+# ) -> bytes:
+#     """Typed event chunk. Clients MUST NOT append to message history."""
+#     obj: Dict[str, Any] = {
+#         "model":      model,
+#         "created_at": now_iso(),
+#         "message":    {"role": "assistant", "content": ""},
+#     #    "event":      {"type": event_type, **payload},
+#         "done":       False,
+#     }
+#     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def make_thinking_chunk(model: str, delta: str) -> bytes:
@@ -166,7 +166,7 @@ def make_thinking_chunk(model: str, delta: str) -> bytes:
             "content":  "",
             "thinking": delta,
         },
-        "event": {"type": "thinking", "delta": delta},
+    #    "event": {"type": "thinking", "delta": delta},
         "done": False,
     }
     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
@@ -176,6 +176,7 @@ def make_done_chunk(
     model: str,
     done_reason: str = "stop",
     usage: Optional[Dict[str, Any]] = None,
+    durations: Optional[Dict[str, int]] = None,
 ) -> bytes:
     obj: Dict[str, Any] = {
         "model":       model,
@@ -184,8 +185,32 @@ def make_done_chunk(
         "done":        True,
         "done_reason": done_reason,
     }
+
     if usage:
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+
+        obj["prompt_eval_count"] = prompt_tokens
+        obj["eval_count"] = completion_tokens
+
         obj["usage"] = usage
+
+        if not durations:
+            p_ns = prompt_tokens * 5_000_000
+            e_ns = completion_tokens * 15_000_000
+            durations = {
+                "total_ns": p_ns + e_ns,
+                "load_ns": 0,
+                "prompt_eval_ns": p_ns,
+                "eval_ns": e_ns,
+            }
+
+    if durations:
+        obj["total_duration"] = durations.get("total_ns", 0)
+        obj["load_duration"] = durations.get("load_ns", 0)
+        obj["prompt_eval_duration"] = durations.get("prompt_eval_ns", 0)
+        obj["eval_duration"] = durations.get("eval_ns", 0)
+
     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
@@ -873,6 +898,11 @@ def version():
     log.debug("ollama version: %s", ollama_version)
     return jsonify({"chatd": f"{VERSION}", "ollama": f"{ollama_version}"})
 
+@app.get("/ps")
+@app.get("/api/ps")
+def ps():
+    """Ollama-compatible running-models list. We don't track loaded models."""
+    return jsonify({"models": []})
 
 @app.get("/health")
 @app.get("/api/health")
@@ -1052,9 +1082,9 @@ def chat_stream_generator(
     # without the RAG sidecar ensure_system_prompt appended.
     last_user_msg = clean_user or _last_user_text(messages)
 
-    data = make_keepalive(model)
-    log.debug("[%s] yield %-12s %d bytes", req_id, "keepalive/0", len(data))
-    yield data
+    #data = make_keepalive(model)
+    #log.debug("[%s] yield %-12s %d bytes", req_id, "keepalive/0", len(data))
+    #yield data
 
     final_assistant_content = ""
     backend = backends.get_backend(model)
@@ -1088,6 +1118,7 @@ def chat_stream_generator(
             chunk_count = 0
             stream_done_reason = "stop"
             stream_usage: Optional[Dict[str, Any]] = None
+            stream_durations: Optional[Dict[str, int]] = None
 
             try:
                 stream = backend.chat_stream(payload)
@@ -1140,6 +1171,7 @@ def chat_stream_generator(
                     if done:
                         stream_done_reason = chunk.get("done_reason", "stop")
                         stream_usage = chunk.get("usage")
+                        stream_durations = chunk.get("durations")
                         log.info(
                             "[%s] round %d done, chunks=%d, tool_calls=%s, "
                             "content_len=%d, done_reason=%s",
@@ -1183,7 +1215,7 @@ def chat_stream_generator(
                     )
                 yield _log_yield(
                     req_id, "done",
-                    make_done_chunk(model, stream_done_reason, stream_usage),
+                    make_done_chunk(model, stream_done_reason, stream_usage, stream_durations),
                 )
                 log.info("[%s] stream complete, no more tool rounds", req_id)
                 break
@@ -1217,14 +1249,14 @@ def chat_stream_generator(
                 tool_args = tc.get("arguments") or {}
                 call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:16]}"
 
-                yield _log_yield(
-                    req_id, "tool/call",
-                    make_event_chunk(model, "tool_call", {
-                        "id":        call_id,
-                        "name":      tool_name,
-                        "arguments": tool_args,
-                    }),
-                )
+                # yield _log_yield(
+                #     req_id, "tool/call",
+                #     make_event_chunk(model, "tool_call", {
+                #         "id":        call_id,
+                #         "name":      tool_name,
+                #         "arguments": tool_args,
+                #     }),
+                # )
 
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
                 tool_result = call_tool(tool_name, tool_args)
@@ -1234,22 +1266,22 @@ def chat_stream_generator(
                 ) else "ok"
                 result_str = _truncate_chat_tool_result(tool_result)
 
-                yield _log_yield(
-                    req_id, "tool/result",
-                    make_event_chunk(model, "tool_result", {
-                        "id":      call_id,
-                        "name":    tool_name,
-                        "status":  status,
-                        "content": result_str,
-                    }),
-                )
+                # yield _log_yield(
+                #     req_id, "tool/result",
+                #     make_event_chunk(model, "tool_result", {
+                #         "id":      call_id,
+                #         "name":    tool_name,
+                #         "status":  status,
+                #         "content": result_str,
+                #     }),
+                # )
 
                 messages.append({
                     "role":    "tool",
                     "content": result_str,
                 })
 
-            yield _log_yield(req_id, "keepalive/tr", make_keepalive(model))
+            # yield _log_yield(req_id, "keepalive/tr", make_keepalive(model))
             last_tool_calls = None
 
         # Fallback: if we never produced final text, force one more call without tools
@@ -1310,6 +1342,7 @@ def chat_stream_generator(
                                 model,
                                 chunk.get("done_reason", "stop"),
                                 chunk.get("usage"),
+                                chunk.get("durations"),
                             ),
                         )
                         break
@@ -1405,7 +1438,13 @@ def chat():
                 )
 
             log.info("[%s] non-stream done, answer_len=%d", req_id, len(answer))
-            return jsonify({"model": model, "answer": answer})
+            return jsonify({
+                "model":       model,
+                "created_at":  now_iso(),
+                "message":     {"role": "assistant", "content": answer},
+                "done":        True,
+                "done_reason": "stop",
+            })
 
         except ReadTimeout:
             log.error("[%s] backend timeout", req_id)

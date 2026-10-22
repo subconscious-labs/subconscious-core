@@ -99,6 +99,13 @@ def _normalize_response(raw: Dict) -> Dict[str, Any]:
                 "prompt_tokens":     prompt_tokens,
                 "completion_tokens": eval_tokens,
             }
+        if "eval_duration" in raw or "prompt_eval_duration" in raw:
+            out["durations"] = {
+                "total_ns":       int(raw.get("total_duration") or 0),
+                "load_ns":        int(raw.get("load_duration") or 0),
+                "prompt_eval_ns": int(raw.get("prompt_eval_duration") or 0),
+                "eval_ns":        int(raw.get("eval_duration") or 0),
+            }
     return out
 
 
