@@ -233,75 +233,83 @@ class MCPClient:
                 self._disconnect_event.set()
                 break
 
-    async def _cleanup(self):
-        if self._stack:
-            try:
-                await self._stack.aclose()
-            except Exception as e:
-                log.debug("[mcp] %s: aclose error: %s", self.name, e)
-            self._stack = None
-        self._session = None
-
-    async def _connect_and_wait(self):
+    async def _run_session(self):
+        """Runs the entire MCP session lifecycle in one task."""
         self._disconnect_event.clear()
-        self._stack = AsyncExitStack()
-
-        if self.transport == "stdio":
-            self._pidfile = Path(f"/tmp/mcp_{self.name}_{os.getpid()}.pid")
-            try:
-                self._pidfile.unlink()
-            except FileNotFoundError:
-                pass
-            wrapped = _wrap_with_pidfile(self.cmd, self._pidfile)
-            read, write = await self._stack.enter_async_context(
-                stdio_client(StdioServerParameters(
-                    command=wrapped[0], args=wrapped[1:], env=os.environ.copy(),
-                ))
-            )
-        elif self.transport == "http":
-            headers: dict[str, str] = {}
-            if self.token:
-                headers["Authorization"] = f"Bearer {self.token}"
-
-            if _HTTP_NEW_API:
-                http_client = create_mcp_http_client(headers=headers or None)
-                await self._stack.enter_async_context(http_client)
-                streams = await self._stack.enter_async_context(
-                    streamable_http_client(self.url, http_client=http_client)
-                )
-                read, write = streams[0], streams[1]
-            else:
-                streams = await self._stack.enter_async_context(
-                    streamable_http_client(self.url, headers=headers)
-                )
-                read, write = streams[0], streams[1]
-        else:
-            raise ValueError(f"unknown transport: {self.transport}")
-
-        self._session = await self._stack.enter_async_context(
-            ClientSession(read, write, message_handler=self._on_notification)
-        )
-        await self._session.initialize()
-
-        log.info("[mcp] %s: connected (%s)", self.name, self.transport)
-
-        if self.transport == "stdio" and self._pidfile:
-            try:
-                self._pid = int(self._pidfile.read_text().strip())
-            except Exception as e:
-                log.warning("[mcp] %s: pid capture failed: %s", self.name, e)
-                self._pid = None
-
-        # Signal that the first connection attempt (or a reconnect) is ready
-        self._connection_ready.set()
-
-        watchdog_task = asyncio.create_task(self._watchdog())
         try:
-            # Block this coroutine until disconnect is requested
-            while not self._disconnect_event.is_set() and not self._shutdown_event.is_set():
-                await asyncio.sleep(0.5)
+            # The AsyncExitStack MUST be inside the task that uses it.
+            async with AsyncExitStack() as stack:
+                self._stack = stack
+
+                if self.transport == "stdio":
+                    self._pidfile = Path(f"/tmp/mcp_{self.name}_{os.getpid()}.pid")
+                    try:
+                        self._pidfile.unlink()
+                    except FileNotFoundError:
+                        pass
+                    wrapped = _wrap_with_pidfile(self.cmd, self._pidfile)
+                    read, write = await stack.enter_async_context(
+                        stdio_client(StdioServerParameters(
+                            command=wrapped[0], args=wrapped[1:], env=os.environ.copy(),
+                        ))
+                    )
+                elif self.transport == "http":
+                    headers: dict[str, str] = {}
+                    if self.token:
+                        headers["Authorization"] = f"Bearer {self.token}"
+
+                    if _HTTP_NEW_API:
+                        http_client = create_mcp_http_client(headers=headers or None)
+                        await stack.enter_async_context(http_client)
+                        streams = await stack.enter_async_context(
+                            streamable_http_client(self.url, http_client=http_client)
+                        )
+                        read, write = streams[0], streams[1]
+                    else:
+                        streams = await stack.enter_async_context(
+                            streamable_http_client(self.url, headers=headers)
+                        )
+                        read, write = streams[0], streams[1]
+                else:
+                    raise ValueError(f"unknown transport: {self.transport}")
+
+                self._session = await stack.enter_async_context(
+                    ClientSession(read, write, message_handler=self._on_notification)
+                )
+                await self._session.initialize()
+
+                log.info("[mcp] %s: connected (%s)", self.name, self.transport)
+
+                if self.transport == "stdio" and self._pidfile:
+                    try:
+                        self._pid = int(self._pidfile.read_text().strip())
+                    except Exception as e:
+                        log.warning("[mcp] %s: pid capture failed: %s", self.name, e)
+                        self._pid = None
+
+                self._connection_ready.set()
+
+                watchdog_task = asyncio.create_task(self._watchdog())
+                try:
+                    # Block this task until disconnect or shutdown is requested
+                    while not self._disconnect_event.is_set() and not self._shutdown_event.is_set():
+                        await asyncio.sleep(0.5)
+                finally:
+                    watchdog_task.cancel()
+                    try:
+                        await watchdog_task
+                    except asyncio.CancelledError:
+                        pass
+        except asyncio.CancelledError:
+            log.debug("[mcp] %s: session cancelled", self.name)
+            raise
+        except Exception as e:
+            log.warning("[mcp] %s: session error: %s", self.name, e)
+            raise
         finally:
-            watchdog_task.cancel()
+            self._session = None
+            self._stack = None
+            log.info("[mcp] %s: disconnected", self.name)
 
     def _connection_loop(self):
         asyncio.set_event_loop(self._loop)
@@ -309,22 +317,22 @@ class MCPClient:
 
         while not self._shutdown_event.is_set():
             try:
-                self._loop.run_until_complete(self._connect_and_wait())
+                self._loop.run_until_complete(self._run_session())
+            except asyncio.CancelledError:
+                # Loop is shutting down or task was cancelled
+                if not self._shutdown_event.is_set():
+                    log.debug("[mcp] %s: task cancelled unexpectedly", self.name)
             except Exception as e:
                 if not self._shutdown_event.is_set():
                     log.warning("[mcp] %s: connection error: %s", self.name, e)
-            finally:
-                self._loop.run_until_complete(self._cleanup())
 
             if self._shutdown_event.is_set():
                 break
 
             log.info("[mcp] %s: reconnecting in %.1fs...", self.name, backoff)
-            # self._shutdown_event.wait allows stop() to interrupt the sleep
             if self._shutdown_event.wait(backoff):
                 break
 
-            # Exponential backoff, max 60 seconds
             backoff = min(backoff * 2, 60.0)
 
     def start(self) -> None:
