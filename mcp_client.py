@@ -32,6 +32,12 @@ except ImportError:
 from config import MCP_ENV_PREFIXES
 
 log = logging.getLogger("chatd.mcp_client")
+# The MCP SDK's HTTP client is very noisy when connections drop,
+# logging full tracebacks for network errors that we already handle
+# via reconnects.
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("httpcore2").setLevel(logging.WARNING)
+logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
 
 from config import _env
 
@@ -300,17 +306,23 @@ class MCPClient:
 
                 self._connection_ready.set()
 
-                watchdog_task = asyncio.create_task(self._watchdog())
+                # HTTP transports have native keep-alive and error handling
+                # via the MCP SDK. Our JSON-RPC ping interferes with it.
+                watchdog_task = None
+                if self.transport == "stdio":
+                    watchdog_task = asyncio.create_task(self._watchdog())
+
                 try:
-                    # Block this task until disconnect or shutdown is requested
                     while not self._disconnect_event.is_set() and not self._shutdown_event.is_set():
                         await asyncio.sleep(0.5)
                 finally:
-                    watchdog_task.cancel()
-                    try:
-                        await watchdog_task
-                    except asyncio.CancelledError:
-                        pass
+                    if watchdog_task:
+                        watchdog_task.cancel()
+                        try:
+                            await watchdog_task
+                        except asyncio.CancelledError:
+                            pass
+
         except asyncio.CancelledError:
             log.debug("[mcp] %s: session cancelled", self.name)
             raise
