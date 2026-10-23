@@ -206,6 +206,8 @@ class MCPClient:
             root = message.root
             method = getattr(root, "method", None)
 
+            log.debug("[mcp] %s: notification received: method=%s", self.name, method)
+
             # We use the standard MCP logging notification as a transport
             # for custom events. Check if it's our special logger.
             if method == "notifications/message":
