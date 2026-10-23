@@ -205,22 +205,28 @@ class MCPClient:
                 return
             root = message.root
             method = getattr(root, "method", None)
-            if method != "notifications/event":
-                return
 
-            params = getattr(root, "params", None) or {}
-            if not isinstance(params, dict):
-                return
+            # We use the standard MCP logging notification as a transport
+            # for custom events. Check if it's our special logger.
+            if method == "notifications/message":
+                params = getattr(root, "params", None) or {}
+                if params.get("logger") != "event":
+                    return
 
-            # Check allowlist: empty list means reject all.
-            from config import MCP_EVENT_ALLOWED
-            if not ("*" in MCP_EVENT_ALLOWED or self.name in MCP_EVENT_ALLOWED):
-                log.warning("[mcp] %s: event rejected (not in MCP_EVENT_ALLOWED)", self.name)
-                return
+                data = params.get("data")
+                if not isinstance(data, dict):
+                    return
 
-            log.info("[mcp] %s: event received: type=%s", self.name, params.get("type"))
-            if self.on_event:
-                self.on_event(self.name, params)
+                # Check allowlist
+                from config import MCP_EVENT_ALLOWED
+                if not ("*" in MCP_EVENT_ALLOWED or self.name in MCP_EVENT_ALLOWED):
+                    log.warning("[mcp] %s: event rejected (not in MCP_EVENT_ALLOWED)", self.name)
+                    return
+
+                log.info("[mcp] %s: event received: type=%s", self.name, data.get("type"))
+                if self.on_event:
+                    self.on_event(self.name, data)
+
         except Exception as e:
             log.error("[mcp] %s: notification handler error: %s", self.name, e)
 
