@@ -201,21 +201,29 @@ class MCPClient:
     async def _on_notification(self, message):
         """Handle server-initiated JSON-RPC notifications."""
         try:
-            if not hasattr(message, "root"):
-                return
-            root = message.root
+            # SDK may pass either a JSONRPCMessage wrapper (with .root)
+            # or the parsed notification object directly.
+            root = getattr(message, "root", message)
             method = getattr(root, "method", None)
 
             log.debug("[mcp] %s: notification received: method=%s", self.name, method)
 
-            # We use the standard MCP logging notification as a transport
-            # for custom events. Check if it's our special logger.
             if method == "notifications/message":
-                params = getattr(root, "params", None) or {}
-                if params.get("logger") != "event":
+                params = getattr(root, "params", None)
+                if not params:
                     return
 
-                data = params.get("data")
+                # Params could be a dict or a Pydantic model
+                logger_name = getattr(params, "logger", None) or (params.get("logger") if isinstance(params, dict) else None)
+                data = getattr(params, "data", None) or (params.get("data") if isinstance(params, dict) else None)
+
+                if logger_name != "event":
+                    return
+
+                if not isinstance(data, dict):
+                    # data might be a Pydantic model
+                    data = getattr(data, "model_dump", lambda: data)()
+
                 if not isinstance(data, dict):
                     return
 
