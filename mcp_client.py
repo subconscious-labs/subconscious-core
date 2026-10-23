@@ -10,7 +10,7 @@ import time
 
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -169,14 +169,11 @@ def _is_zombie(pid: int) -> bool:
 
 
 class MCPClient:
-    """Long-lived MCP client. Supports stdio and streamable HTTP transports.
+    """Long-lived MCP client with auto-reconnect and progressive backoff."""
 
-    Call start() once after construction, stop() on shutdown.
-    list_tools() and call_tool() reuse the persistent session.
-    """
-
-    def __init__(self, cfg: dict, name: str = "?"):
+    def __init__(self, cfg: dict, name: str = "?", on_event: Optional[Callable] = None):
         self.name = name
+        self.on_event = on_event
         self.transport: str = cfg.get("transport", "stdio")
         self.cmd: list[str] = cfg.get("cmd", []) or []
         self.url: str = cfg.get("url", "") or ""
@@ -186,21 +183,67 @@ class MCPClient:
         self._stack: Optional[AsyncExitStack] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
+
         self._pid: Optional[int] = None
         self._pidfile: Optional[Path] = None
-        # RLock because restart() re-enters via stop_graceful().
-        # Serializes signal/restart against concurrent call_tool/list_tools.
         self._op_lock = threading.RLock()
+        # Connection management
+        self._shutdown_event = threading.Event()
+        self._connection_ready = threading.Event()
+        self._disconnect_event = threading.Event()
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    async def _on_notification(self, message):
+        """Handle server-initiated JSON-RPC notifications."""
+        try:
+            if not hasattr(message, "root"):
+                return
+            root = message.root
+            method = getattr(root, "method", None)
+            if method != "notifications/event":
+                return
 
-    def _loop_forever(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+            params = getattr(root, "params", None) or {}
+            if not isinstance(params, dict):
+                return
 
-    async def _start_async(self) -> None:
+            # Check allowlist: empty list means reject all.
+            from config import MCP_EVENT_ALLOWED
+            if not ("*" in MCP_EVENT_ALLOWED or self.name in MCP_EVENT_ALLOWED):
+                log.warning("[mcp] %s: event rejected (not in MCP_EVENT_ALLOWED)", self.name)
+                return
+
+            log.info("[mcp] %s: event received: type=%s", self.name, params.get("type"))
+            if self.on_event:
+                self.on_event(self.name, params)
+        except Exception as e:
+            log.error("[mcp] %s: notification handler error: %s", self.name, e)
+
+    async def _watchdog(self):
+        """Ping the server to detect silent connection drops."""
+        while not self._shutdown_event.is_set() and not self._disconnect_event.is_set():
+            await asyncio.sleep(10)
+            if self._shutdown_event.is_set() or not self._session:
+                break
+            try:
+                # MCP Protocol supports ping
+                if hasattr(self._session, "send_ping"):
+                    await self._session.send_ping()
+            except Exception as e:
+                log.warning("[mcp] %s: ping failed: %s", self.name, e)
+                self._disconnect_event.set()
+                break
+
+    async def _cleanup(self):
+        if self._stack:
+            try:
+                await self._stack.aclose()
+            except Exception as e:
+                log.debug("[mcp] %s: aclose error: %s", self.name, e)
+            self._stack = None
+        self._session = None
+
+    async def _connect_and_wait(self):
+        self._disconnect_event.clear()
         self._stack = AsyncExitStack()
 
         if self.transport == "stdio":
@@ -226,8 +269,6 @@ class MCPClient:
                 streams = await self._stack.enter_async_context(
                     streamable_http_client(self.url, http_client=http_client)
                 )
-                # Newer SDK returns 2-tuple (TransportStreams);
-                # older returns 3-tuple. Slicing works for both.
                 read, write = streams[0], streams[1]
             else:
                 streams = await self._stack.enter_async_context(
@@ -238,70 +279,93 @@ class MCPClient:
             raise ValueError(f"unknown transport: {self.transport}")
 
         self._session = await self._stack.enter_async_context(
-            ClientSession(read, write)
+            ClientSession(read, write, message_handler=self._on_notification)
         )
         await self._session.initialize()
+
+        log.info("[mcp] %s: connected (%s)", self.name, self.transport)
 
         if self.transport == "stdio" and self._pidfile:
             try:
                 self._pid = int(self._pidfile.read_text().strip())
-                log.debug("[mcp] %s: captured pid=%d", self.name, self._pid)
             except Exception as e:
                 log.warning("[mcp] %s: pid capture failed: %s", self.name, e)
                 self._pid = None
 
+        # Signal that the first connection attempt (or a reconnect) is ready
+        self._connection_ready.set()
+
+        watchdog_task = asyncio.create_task(self._watchdog())
+        try:
+            # Block this coroutine until disconnect is requested
+            while not self._disconnect_event.is_set() and not self._shutdown_event.is_set():
+                await asyncio.sleep(0.5)
+        finally:
+            watchdog_task.cancel()
+
+    def _connection_loop(self):
+        asyncio.set_event_loop(self._loop)
+        backoff = 1.0
+
+        while not self._shutdown_event.is_set():
+            try:
+                self._loop.run_until_complete(self._connect_and_wait())
+            except Exception as e:
+                if not self._shutdown_event.is_set():
+                    log.warning("[mcp] %s: connection error: %s", self.name, e)
+            finally:
+                self._loop.run_until_complete(self._cleanup())
+
+            if self._shutdown_event.is_set():
+                break
+
+            log.info("[mcp] %s: reconnecting in %.1fs...", self.name, backoff)
+            # self._shutdown_event.wait allows stop() to interrupt the sleep
+            if self._shutdown_event.wait(backoff):
+                break
+
+            # Exponential backoff, max 60 seconds
+            backoff = min(backoff * 2, 60.0)
 
     def start(self) -> None:
-        if self._loop is not None:
-            log.warning("[mcp] %s: start() called but already running", self.name)
+        if self._thread and self._thread.is_alive():
             return
+
         self._loop = asyncio.new_event_loop()
+        self._shutdown_event.clear()
+        self._connection_ready.clear()
+
         self._thread = threading.Thread(
-            target=self._loop_forever, daemon=True,
+            target=self._connection_loop, daemon=True,
             name=f"mcp-loop-{self.name}",
         )
         self._thread.start()
-        fut = asyncio.run_coroutine_threadsafe(self._start_async(), self._loop)
-        try:
-            fut.result(timeout=30)
-            log.info("[mcp] started: %s (%s)", self.name, self.transport)
-        except Exception as e:
-            log.error("[mcp] failed to start %s: %s", self.name, e)
-            self._shutdown_loop()
-            raise
 
-    def _shutdown_loop(self) -> None:
-        if self._loop is None:
-            return
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-        self._loop.close()
-        self._loop = None
-        self._thread = None
-        self._session = None
-        self._stack = None
+        # Wait up to 30s for the initial connection to succeed
+        if not self._connection_ready.wait(timeout=30):
+            log.error("[mcp] %s: initial connection timed out", self.name)
+            self.stop()
+            raise RuntimeError(f"MCP server {self.name} initial connection timed out")
 
     def stop(self) -> None:
-        if self._stack and self._loop:
-            try:
-                fut = asyncio.run_coroutine_threadsafe(
-                    self._stack.aclose(), self._loop
-                )
-                fut.result(timeout=10)
-            except Exception as e:
-                log.debug("[mcp] stop aclose error: %s", e)
-        self._shutdown_loop()
-        log.info("[mcp] stopped: %s", self.name)
+        self._shutdown_event.set()
+        self._disconnect_event.set()
+
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+        if self._loop:
+            self._loop.close()
+            self._loop = None
+
+        self._session = None
+        self._stack = None
+        self._pid = None
 
     def signal(self, sig: int) -> bool:
-        """Send a signal to the stdio child process. Returns True on success."""
-        if self.transport != "stdio":
-            log.warning("[mcp] %s: signals not supported for %s transport",
-                        self.name, self.transport)
-            return False
-        if not self._pid:
-            log.warning("[mcp] %s: no pid captured, cannot signal", self.name)
+        """Send a signal to the stdio child process."""
+        if self.transport != "stdio" or not self._pid:
             return False
         try:
             os.kill(self._pid, sig)
@@ -312,173 +376,57 @@ class MCPClient:
             self._pid = None
             return False
         except PermissionError as e:
-            log.error("[mcp] %s: signal(%d) permission denied: %s",
-                      self.name, sig, e)
+            log.error("[mcp] %s: signal(%d) permission denied: %s", self.name, sig, e)
             return False
-
-    def _wait_exit(self, timeout: float) -> bool:
-        """Poll until the child exits, becomes a zombie, or times out."""
-        if not self._pid:
-            return True
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                os.kill(self._pid, 0)
-            except ProcessLookupError:
-                return True
-            except PermissionError:
-                pass
-            if _is_zombie(self._pid):
-                return True
-            time.sleep(0.1)
-        return False
-
-    def stop_graceful(self, term_timeout: float = 5.0,
-                      kill_timeout: float = 2.0) -> bool:
-        """Stop the child: aclose session, wait, SIGTERM, SIGKILL if needed.
-
-        Called from restart(). Safe to call on a live client.
-        """
-        with self._op_lock:
-            # Close the async stack first - this closes stdin, often
-            # enough to make the child exit gracefully on its own.
-            if self._stack and self._loop:
-                try:
-                    fut = asyncio.run_coroutine_threadsafe(
-                        self._stack.aclose(), self._loop
-                    )
-                    fut.result(timeout=3.0)
-                except Exception as e:
-                    log.debug("[mcp] %s: aclose during stop: %s", self.name, e)
-
-            if self.transport == "stdio" and self._pid:
-                if not self._wait_exit(2.0):
-                    log.info("[mcp] %s: sending SIGTERM to pid %d",
-                             self.name, self._pid)
-                    try:
-                        os.kill(self._pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    if not self._wait_exit(term_timeout):
-                        log.warning(
-                            "[mcp] %s: SIGTERM ignored after %.1fs, sending SIGKILL",
-                            self.name, term_timeout,
-                        )
-                        try:
-                            os.kill(self._pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        self._wait_exit(kill_timeout)
-
-            self._shutdown_loop()
-            self._pid = None
-            if self._pidfile:
-                try:
-                    self._pidfile.unlink()
-                except FileNotFoundError:
-                    pass
-            log.info("[mcp] %s: stopped gracefully", self.name)
-            return True
 
     def restart(self, force: bool = False) -> bool:
         """Stop and start again. force=True means SIGKILL immediately."""
-        with self._op_lock:
-            if force and self.transport == "stdio" and self._pid:
-                log.warning("[mcp] %s: force-restart (SIGKILL pid %d)",
-                            self.name, self._pid)
-                try:
-                    os.kill(self._pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                self._wait_exit(2.0)
-                if self._stack and self._loop:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self._stack.aclose(), self._loop
-                        ).result(timeout=2.0)
-                    except Exception:
-                        pass
-                self._shutdown_loop()
-                self._pid = None
-                if self._pidfile:
-                    try:
-                        self._pidfile.unlink()
-                    except FileNotFoundError:
-                        pass
-            else:
-                self.stop_graceful()
-
+        log.info("[mcp] %s: restarting (force=%s)", self.name, force)
+        if force and self.transport == "stdio" and self._pid:
+            log.warning("[mcp] %s: force-restart (SIGKILL pid %d)", self.name, self._pid)
             try:
-                self.start()
-                return True
-            except Exception as e:
-                log.error("[mcp] %s: restart failed: %s", self.name, e)
-                return False
+                os.kill(self._pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        self.stop()
+        try:
+            self.start()
+            return True
+        except Exception as e:
+            log.error("[mcp] %s: restart failed: %s", self.name, e)
+            return False
 
     def reload(self, wait: float = 2.0) -> Dict[str, Any]:
-        """Try SIGHUP; fall back to restart if the server dies or stops working.
-
-        Many servers (Go binaries like lazy-mcp, time-mcp) either ignore
-        SIGHUP silently or die on it - SIGHUP's default action is termination
-        unless a handler is installed. Even servers with a handler registered
-        (visible in /proc/<pid>/status SigCgt) sometimes do nothing useful
-        with it. Only the post-signal check is authoritative.
-
-        Returns a dict describing what actually happened:
-          {"status": "reloaded", "pid": <pid>}
-          {"status": "restarted_after_sighup",
-           "pid": <new_pid>,
-           "reason": "process died" | "list_tools failed" | "process gone"}
-          {"status": "failed", "error": "..."}
-        """
+        """Try SIGHUP; fall back to restart if the server dies or stops working."""
         if self.transport != "stdio":
-            return {"status": "failed",
-                    "error": f"reload not supported for {self.transport}"}
+            return {"status": "failed", "error": f"reload not supported for {self.transport}"}
         if not self._pid:
             return {"status": "failed", "error": "no pid captured"}
 
-        with self._op_lock:
-            old_pid = self._pid
+        old_pid = self._pid
+        if not self.signal(signal.SIGHUP):
+            return self._restart_after_reload_failure(old_pid, "process gone before signal")
 
-            if not self.signal(signal.SIGHUP):
-                reason = "process gone before signal"
-                log.warning("[mcp] %s: %s, falling back to restart",
-                            self.name, reason)
-                return self._restart_after_reload_failure(old_pid, reason)
+        time.sleep(wait)
 
-            time.sleep(wait)
+        if not self._pid or _is_zombie(self._pid):
+            return self._restart_after_reload_failure(old_pid, "process died after SIGHUP")
 
-            if not self._pid or _is_zombie(self._pid):
-                reason = "process died after SIGHUP"
-                log.warning("[mcp] %s: %s, falling back to restart",
-                            self.name, reason)
-                return self._restart_after_reload_failure(old_pid, reason)
+        try:
+            tools = self.list_tools()
+            log.info("[mcp] %s: SIGHUP ok, still serving %d tools", self.name, len(tools))
+            return {"status": "reloaded", "pid": self._pid}
+        except Exception as e:
+            return self._restart_after_reload_failure(old_pid, f"list_tools failed after SIGHUP: {e}")
 
-            try:
-                tools = self.list_tools()
-                log.info("[mcp] %s: SIGHUP ok, still serving %d tools",
-                         self.name, len(tools))
-                return {"status": "reloaded", "pid": self._pid}
-            except Exception as e:
-                reason = f"list_tools failed after SIGHUP: {e}"
-                log.warning("[mcp] %s: %s, falling back to restart",
-                            self.name, reason)
-                return self._restart_after_reload_failure(old_pid, reason)
-
-    def _restart_after_reload_failure(self, old_pid: int,
-                                      reason: str) -> Dict[str, Any]:
-        """Restart the client after a failed SIGHUP. Caller holds _op_lock."""
-        # If the process is dead, skip the graceful path - there's nothing
-        # left to be graceful about. If it's still alive (SIGHUP was
-        # ignored, nothing changed), we still need a real restart to pick
-        # up a new config, so graceful stop is fine.
+    def _restart_after_reload_failure(self, old_pid: int, reason: str) -> Dict[str, Any]:
+        log.warning("[mcp] %s: %s, falling back to restart", self.name, reason)
         force = not self._pid or _is_zombie(self._pid)
         ok = self.restart(force=force)
         if not ok:
-            return {"status": "failed",
-                    "error": f"restart failed after: {reason}"}
-        log.info("[mcp] %s: restarted after failed reload (%s), new pid=%s",
-                 self.name, reason, self._pid)
+            return {"status": "failed", "error": f"restart failed after: {reason}"}
+        log.info("[mcp] %s: restarted after failed reload, new pid=%s", self.name, self._pid)
         return {
             "status": "restarted_after_sighup",
             "pid": self._pid,
@@ -488,41 +436,36 @@ class MCPClient:
 
     def _run(self, coro, timeout: float):
         if self._loop is None or self._session is None:
-            raise RuntimeError(f"MCPClient not started: {self.name}")
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(timeout=timeout)
+            raise RuntimeError(f"MCPClient not connected: {self.name}")
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return fut.result(timeout=timeout)
+        except Exception:
+            # If the underlying connection dropped, ensure the loop knows
+            # to reconnect on the next cycle.
+            self._disconnect_event.set()
+            raise
 
     def list_tools(self) -> list:
         if not self._op_lock.acquire(timeout=1.0):
-            raise RuntimeError(
-                f"MCP server {self.name} is busy (restart/reload in progress)"
-            )
+            raise RuntimeError(f"MCP server {self.name} is busy (restart/reload in progress)")
         try:
             try:
                 result = self._run(self._session.list_tools(), MCP_LIST_TOOLS_TIMEOUT)
                 return result.tools
             except asyncio.TimeoutError:
-                log.error(
-                    "[mcp] list_tools timed out after %.0fs: %s",
-                    MCP_LIST_TOOLS_TIMEOUT, self.name,
-                )
+                log.error("[mcp] list_tools timed out after %.0fs: %s", MCP_LIST_TOOLS_TIMEOUT, self.name)
                 if self.transport == "stdio":
                     _kill_process(self.cmd)
-                raise RuntimeError(
-                    f"MCP list_tools timeout ({MCP_LIST_TOOLS_TIMEOUT:.0f}s): {self.name}"
-                )
+                self._disconnect_event.set()
+                raise RuntimeError(f"MCP list_tools timeout ({MCP_LIST_TOOLS_TIMEOUT:.0f}s): {self.name}")
         finally:
             self._op_lock.release()
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         if not self._op_lock.acquire(timeout=1.0):
-            raise RuntimeError(
-                f"MCP server {self.name} is busy (restart/reload in progress)"
-            )
+            raise RuntimeError(f"MCP server {self.name} is busy (restart/reload in progress)")
         try:
             return self._call_tool_inner(name, arguments)
         finally:
@@ -535,15 +478,11 @@ class MCPClient:
                 MCP_CALL_TOOL_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            log.error(
-                "[mcp] call_tool '%s' timed out after %.0fs: %s",
-                name, MCP_CALL_TOOL_TIMEOUT, self.name,
-            )
+            log.error("[mcp] call_tool '%s' timed out after %.0fs: %s", name, MCP_CALL_TOOL_TIMEOUT, self.name)
             if self.transport == "stdio":
                 _kill_process(self.cmd)
-            raise RuntimeError(
-                f"MCP call_tool timeout ({MCP_CALL_TOOL_TIMEOUT:.0f}s): {name}"
-            )
+            self._disconnect_event.set()
+            raise RuntimeError(f"MCP call_tool timeout ({MCP_CALL_TOOL_TIMEOUT:.0f}s): {name}")
 
         contents = getattr(result, "content", None) or []
         if not contents:

@@ -49,6 +49,12 @@ _default_allowed = (
 )
 TOOLS_ALLOWED: Set[str] = set(_env("TOOLS_ALLOWED", _default_allowed).split(","))
 
+# Which MCP servers are allowed to push notifications/event.
+# Empty set = none (default). Use "*" to allow all.
+MCP_EVENT_ALLOWED: Set[str] = set(
+    s.strip() for s in _env("MCP_EVENT_ALLOWED", "").split(",") if s.strip()
+)
+
 # ── Tool rounds ───────────────────────────────────────────────────────────────
 MAX_TOOL_ROUNDS: int = int(_env("MAX_TOOL_ROUNDS", "5"))
 

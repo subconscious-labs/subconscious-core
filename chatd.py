@@ -709,8 +709,17 @@ def load_tools():
     registry = {}
     clients  = []
 
+    def _mcp_event_cb(server_name: str, params: dict):
+        process_event(
+            event_type=params.get("type", "event"),
+            event_source=params.get("source", server_name),
+            event_payload=params.get("payload", {}),
+            model=params.get("model"),
+            options=params.get("options")
+        )
+
     for server_name, cfg in discover_mcp_servers().items():
-        client = MCPClient(cfg, name=server_name)
+        client = MCPClient(cfg, name=server_name, on_event=_mcp_event_cb)
         try:
             client.start()
         except Exception as e:
@@ -1560,36 +1569,23 @@ def generate():
     )
 
 
-# ── /api/event ──────────────────────────────────────────────────────────────────────
+# ── /api/event ────────────────────────────────────────────────────────────────
 
-@app.post("/api/event")
-def system_event():
-    req_id = uuid.uuid4().hex[:8]
+def process_event(
+    event_type: str,
+    event_source: str,
+    event_payload: Dict[str, Any],
+    model: Optional[str] = None,
+    options: Optional[Dict[str, Any]] = None,
+    req_id: Optional[str] = None,
+) -> str:
+    """Common event dispatch logic used by both /api/event and MCP notifications."""
+    req_id = req_id or uuid.uuid4().hex[:8]
+    model = model or EVENT_MODEL or "qwen3:8b"
+    options = merge_options(options)
 
-    denied = _check_event_token()
-    if denied:
-        return denied
-
-    try:
-        ev = request.get_json(force=True, silent=False) or {}
-    except Exception as e:
-        log.error("[%s] event: bad JSON: %s", req_id, e)
-        return jsonify({"error": "invalid JSON"}), 400
-
-    event_type   = ev.get("type", "event")
-    event_source = ev.get("source", "unknown")
-    if "payload" in ev:
-        event_payload = ev["payload"]
-    else:
-        event_payload = {k: v for k, v in ev.items()
-                         if k not in ("type", "source", "model", "options")}
-    model   = ev.get("model") or EVENT_MODEL or "qwen3:8b"
-    options = merge_options(ev.get("options"))
-
-    log.info(
-        "[%s] system event: type=%s source=%s model=%s",
-        req_id, event_type, event_source, model,
-    )
+    log.info("[%s] system event: type=%s source=%s model=%s",
+             req_id, event_type, event_source, model)
 
     event_text = (
         f"[SYSTEM EVENT] type={event_type} source={event_source}\n"
@@ -1597,8 +1593,6 @@ def system_event():
         f"{_EVENT_DIRECTIVE}"
     )
     messages: List[Dict[str, Any]] = [{"role": "user", "content": event_text}]
-
-    # /api/event has no session context - session=None, wake-up not cached
     messages, layer_sizes = ensure_system_prompt(messages, session=None)
 
     def _run():
@@ -1613,7 +1607,31 @@ def system_event():
 
     t = threading.Thread(target=_run, daemon=True, name=f"event-{req_id}")
     t.start()
+    return req_id
 
+
+@app.post("/api/event")
+def system_event():
+    denied = _check_event_token()
+    if denied:
+        return denied
+    try:
+        ev = request.get_json(force=True, silent=False) or {}
+    except Exception as e:
+        return jsonify({"error": "invalid JSON"}), 400
+
+    event_type   = ev.get("type", "event")
+    event_source = ev.get("source", "unknown")
+    if "payload" in ev:
+        event_payload = ev["payload"]
+    else:
+        event_payload = {k: v for k, v in ev.items()
+                         if k not in ("type", "source", "model", "options")}
+
+    req_id = process_event(
+        event_type, event_source, event_payload,
+        model=ev.get("model"), options=ev.get("options")
+    )
     return jsonify({"ok": True, "req_id": req_id}), 202
 
 
