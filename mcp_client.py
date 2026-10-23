@@ -220,18 +220,29 @@ class MCPClient:
 
     async def _watchdog(self):
         """Ping the server to detect silent connection drops."""
+        ping_failures = 0
         while not self._shutdown_event.is_set() and not self._disconnect_event.is_set():
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)  # Увеличили интервал до 30 секунд
             if self._shutdown_event.is_set() or not self._session:
                 break
             try:
-                # MCP Protocol supports ping
                 if hasattr(self._session, "send_ping"):
                     await self._session.send_ping()
+                ping_failures = 0
             except Exception as e:
-                log.warning("[mcp] %s: ping failed: %s", self.name, e)
-                self._disconnect_event.set()
-                break
+                err_str = str(e).lower()
+                # Если сервер не реализовал ping, просто отключаем watchdog
+                if "method not found" in err_str or "-32601" in err_str:
+                    log.info("[mcp] %s: server does not support ping, disabling watchdog", self.name)
+                    return
+
+                # Для остальных ошибок делаем 3 попытки перед разрывом
+                ping_failures += 1
+                log.warning("[mcp] %s: ping failed (%d/3): %s", self.name, ping_failures, e)
+                if ping_failures >= 3:
+                    log.error("[mcp] %s: too many consecutive ping failures, disconnecting", self.name)
+                    self._disconnect_event.set()
+                    break
 
     async def _run_session(self):
         """Runs the entire MCP session lifecycle in one task."""
