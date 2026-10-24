@@ -93,6 +93,11 @@ _EVENT_DIRECTIVE = (
     "  After all action tools are done, call send_message again to report\n"
     "  what was done and what was found.\n"
     "\n"
+    "STEP 4 - Persist (only for important events):\n"
+    "  If this event is an alert, a security issue, or an anomaly, save a brief\n"
+    "  summary to long-term memory using `mempalace_add_drawer` or `mempalace_kg_add`,\n"
+    "  so you can recall it later if asked.\n"
+    "\n"
     "Do NOT skip STEP 1. Do NOT write a plain-text summary without calling send_message."
 )
 
@@ -1571,10 +1576,34 @@ def generate():
 
 # ── /api/event ────────────────────────────────────────────────────────────────
 
+def _log_event_journal(req_id: str, event_type: str, event_source: str, payload: Dict[str, Any], answer: Optional[str] = None) -> None:
+    """Append event and its outcome to a dedicated journal file."""
+    try:
+        from pathlib import Path
+        log_file = Path("/var/lib/subconscious/events.jsonl")
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        entry = {
+            "req_id": req_id,
+            "ts": now_iso(),
+            "type": event_type,
+            "source": event_source,
+            "payload": payload,
+            "status": "done" if answer is not None else "started"
+        }
+        if answer is not None:
+            entry["answer"] = answer
+
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning("[event] failed to write journal: %s", e)
+
+
 def process_event(
     event_type: str,
     event_source: str,
-    event_payload: Dict[str, Any],
+    event_payload: Any,
     model: Optional[str] = None,
     options: Optional[Dict[str, Any]] = None,
     req_id: Optional[str] = None,
@@ -1584,8 +1613,15 @@ def process_event(
     model = model or EVENT_MODEL or "qwen3:8b"
     options = merge_options(options)
 
+    # Normalize payload: it might be a raw string (from some downstream servers),
+    # or a dict with arbitrary structure. Ensure it's JSON-safe.
+    if not isinstance(event_payload, (dict, list)):
+        event_payload = {"text": str(event_payload)}
+
     log.info("[%s] system event: type=%s source=%s model=%s",
              req_id, event_type, event_source, model)
+
+    _log_event_journal(req_id, event_type, event_source, event_payload)
 
     event_text = (
         f"[SYSTEM EVENT] type={event_type} source={event_source}\n"
@@ -1601,6 +1637,7 @@ def process_event(
                 model, messages, options, layer_sizes, req_id,
                 final_num_predict=EVENT_FINAL_ROUND_NUM_PREDICT,
             )
+            _log_event_journal(req_id, event_type, event_source, event_payload, answer)
             log.info("[%s] event worker done, answer_len=%d", req_id, len(answer))
         except Exception:
             log.error("[%s] event worker error:\n%s", req_id, traceback.format_exc())
