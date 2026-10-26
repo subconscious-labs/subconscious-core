@@ -717,12 +717,38 @@ def load_tools():
     clients  = []
 
     def _mcp_event_cb(server_name: str, params: dict):
+        """Normalise an inbound MCP notification into process_event() inputs.
+
+        Payload shape is not standardised across servers. Three forms are
+        handled:
+
+        1. Structured dict:   {"payload": {"from": "...", "body": "..."}}
+        2. Bare string:       {"payload": "user@domain: message"}  - xmpp-mcp
+        3. Fields on data:    {"from": "...", "body": "..."}        - no envelope
+
+        A bare string is preserved as `text` so session extraction can still
+        attempt to recover the sender from a "user@domain: " prefix.
+        """
+        raw = params.get("payload")
+
+        if isinstance(raw, dict) and raw:
+            payload = raw
+        elif isinstance(raw, str) and raw.strip():
+            payload = {"text": raw.strip()}
+        elif any(k in params for k in ("from", "body", "room", "text")):
+            payload = {
+                k: v for k, v in params.items()
+                if k not in ("type", "source", "model", "options")
+            }
+        else:
+            payload = {}
+
         process_event(
-            event_type=params.get("type", "event"),
-            event_source=params.get("source", server_name),
-            event_payload=params.get("payload", {}),
+            event_type=params.get("type") or "event",
+            event_source=params.get("source") or server_name,
+            event_payload=payload,
             model=params.get("model"),
-            options=params.get("options")
+            options=params.get("options"),
         )
 
     for server_name, cfg in discover_mcp_servers().items():
@@ -1631,6 +1657,19 @@ def _extract_session_key(
             from_jid = val.strip()
             break
 
+    # Structured payloads carry a dedicated JID field. If none is present,
+    # fall back to a "user@domain: message" prefix produced by servers that
+    # flatten XMPP metadata into a single text blob.
+    if not from_jid:
+        text = event_payload.get("text")
+        if isinstance(text, str):
+            m = re.match(
+                r"^([^\s@:]+@[^\s:/]+)(?:/[^\s:]+)?\s*:\s",
+                text,
+            )
+            if m:
+                from_jid = m.group(1)
+
     if not from_jid:
         return None
 
@@ -1818,6 +1857,11 @@ def process_event(
         payload_dict = event_payload
 
     session_key = _extract_session_key(event_source, payload_dict)
+
+    log.info(
+        "[%s] session_key probe: source=%r payload_keys=%s session_key=%r",
+        req_id, event_source, sorted(payload_dict.keys())[:10], session_key,
+    )
 
     # Idempotency: skip re-delivered events.
     if session_key and _is_duplicate_event(session_key, payload_dict):
