@@ -5,15 +5,16 @@ import json
 import logging
 import os
 import re
+import requests
 import threading
 import traceback
 import uuid
+from collections import deque
 from datetime import datetime, timezone
+from flask import Flask, request, Response, jsonify, stream_with_context
+from requests.exceptions import ReadTimeout, RequestException
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
-import requests
-from requests.exceptions import ReadTimeout, RequestException
-from flask import Flask, request, Response, jsonify, stream_with_context
 
 import backends
 import background
@@ -39,6 +40,7 @@ from config import (
     DEEPSEEK_API_MODELS,
     BG_ENABLED,
     BG_TOKEN,
+    _env,
 )
 from backends.ollama import OLLAMA_API
 from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
@@ -1576,6 +1578,193 @@ def generate():
 
 # ── /api/event ────────────────────────────────────────────────────────────────
 
+# ── event session handling ────────────────────────────────────────────────────
+#
+# Events that carry enough context to identify a session (XMPP JID, explicit
+# session_key) are processed as part of that session's dialogue: history is
+# loaded, the event becomes the latest user turn, and the answer is recorded
+# back into the session log. Stateless processing remains the fallback for
+# anonymous system events (alerts, monitor pings, etc.).
+#
+# The key invariants:
+#   - forgettable: session_key parsing is best-effort. Unknown sources fall
+#     back to stateless - no event is dropped just because it has no JID.
+#   - idempotent: duplicate message ids (re-delivery) are skipped per session.
+#   - serialized: two events from the same session never run concurrently -
+#     the second waits for the first to finish and sees its answer in history.
+
+_SEEN_EVENT_IDS: Dict[str, "deque[str]"] = {}
+_SEEN_EVENT_IDS_GUARD = threading.Lock()
+_SEEN_EVENT_IDS_MAX = 200
+
+_SESSION_LOCKS: Dict[str, threading.Lock] = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+
+
+def _extract_session_key(
+    event_source: str,
+    event_payload: Dict[str, Any],
+) -> Optional[str]:
+    """Extract a stable session key from an event payload.
+
+    Priority:
+      1. Explicit `session_key` field in the payload - any MCP source can
+         opt in by setting it, without chatd needing to know the source.
+      2. XMPP-specific JID-based key for dm and groupchat events.
+
+    Returns a lowercase key like "xmpp:dm:user@domain" or None when no
+    session can be determined (the event will be processed stateless).
+    """
+    explicit = event_payload.get("session_key")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip().lower()
+
+    if not event_source.startswith("xmpp"):
+        return None
+
+    # Different MCP servers use different field names. Try them in priority
+    # order so we do not couple to one implementation.
+    from_jid = None
+    for key in ("from", "from_jid", "sender", "from_bare", "jid"):
+        val = event_payload.get(key)
+        if isinstance(val, str) and val.strip():
+            from_jid = val.strip()
+            break
+
+    if not from_jid:
+        return None
+
+    # Bare JID: strip resource. user@domain/resource -> user@domain.
+    bare = from_jid.split("/", 1)[0].lower()
+    if not bare or "@" not in bare:
+        return None
+
+    # Ignore self - protects against echo loops if the XMPP server
+    # delivers our own outgoing messages back as events.
+    self_jid = _env("XMPP_SELF_JID", "").strip().lower()
+    if self_jid:
+        self_bare = self_jid.split("/", 1)[0]
+        if bare == self_bare:
+            return None
+
+    # MUC detection. In a groupchat, `from` is room@conference.domain/nick;
+    # the bare JID is the room itself, so every occupant shares one session.
+    is_muc = (
+        event_payload.get("type") == "groupchat"
+        or bool(event_payload.get("room"))
+        or bool(event_payload.get("muc"))
+    )
+    if is_muc:
+        return f"xmpp:muc:{bare}"
+    return f"xmpp:dm:{bare}"
+
+
+def _extract_event_human_text(payload: Dict[str, Any]) -> str:
+    """Pull the human-readable portion of an event payload.
+
+    Used as the `user` side of the session log entry, so the JSONL shows
+    the actual message text rather than a JSON envelope. Falls back to ""
+    when the payload is a pure system event with no human content.
+    """
+    for key in ("body", "message", "text", "content"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _is_duplicate_event(session_key: str, payload: Dict[str, Any]) -> bool:
+    """Return True if this event id was already processed for this session.
+
+    Best-effort: the buffer lives in memory and is lost on restart. That
+    is acceptable - dedupe protects against the transport re-delivering
+    the same notification, not against a deliberate replay days later.
+    """
+    msg_id = None
+    for key in ("id", "message_id", "stanza_id"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            msg_id = val.strip()
+            break
+    if not msg_id:
+        return False
+
+    with _SEEN_EVENT_IDS_GUARD:
+        buf = _SEEN_EVENT_IDS.get(session_key)
+        if buf is None:
+            buf = deque(maxlen=_SEEN_EVENT_IDS_MAX)
+            _SEEN_EVENT_IDS[session_key] = buf
+        if msg_id in buf:
+            return True
+        buf.append(msg_id)
+    return False
+
+
+def _get_session_lock(session_key: str) -> threading.Lock:
+    """Return (and lazily create) the per-session lock.
+
+    The dict grows unbounded, but for a single-agent deployment the number
+    of distinct sessions is small. If this ever becomes a problem, swap
+    for an LRU with eviction on lock release.
+    """
+    with _SESSION_LOCKS_GUARD:
+        lock = _SESSION_LOCKS.get(session_key)
+        if lock is None:
+            lock = threading.Lock()
+            _SESSION_LOCKS[session_key] = lock
+        return lock
+
+
+def _load_session_history(
+    session: "sess.Session",
+    limit_turns: int = MAX_HISTORY_TURNS,
+) -> List[Dict[str, Any]]:
+    """Load the last N turns from a session's JSONL chatlog.
+
+    Returns messages in OpenAI format: [{role, content}, ...].
+    Only human/assistant messages with non-empty content are returned.
+    The chatlog format is produced by Session.append_chatlog():
+      {"type": "human",     "message": {"role": "human",     "content": "..."}}
+      {"type": "assistant", "message": {"role": "assistant", "content": "..."}}
+    """
+    try:
+        path = session._jsonl_path()
+    except Exception as e:
+        log.warning("[event] cannot resolve session path: %s", e)
+        return []
+
+    if not path.exists():
+        return []
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except Exception as e:
+        log.warning("[event] failed to read session log %s: %s", path, e)
+        return []
+
+    # Keep last N turns (= 2N lines). Slice before parsing to bound work.
+    max_lines = max(2, limit_turns * 2)
+    lines = lines[-max_lines:]
+
+    messages: List[Dict[str, Any]] = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        msg = entry.get("message") or {}
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if role in ("human", "user"):
+            messages.append({"role": "user", "content": content})
+        elif role == "assistant":
+            messages.append({"role": "assistant", "content": content})
+    return messages
+
+
 def _log_event_journal(req_id: str, event_type: str, event_source: str, payload: Dict[str, Any], answer: Optional[str] = None) -> None:
     """Append event and its outcome to a dedicated journal file."""
     try:
@@ -1608,39 +1797,100 @@ def process_event(
     options: Optional[Dict[str, Any]] = None,
     req_id: Optional[str] = None,
 ) -> str:
-    """Common event dispatch logic used by both /api/event and MCP notifications."""
+    """Common event dispatch logic used by /api/event and MCP notifications.
+
+    If the event identifies a session (XMPP JID, explicit session_key),
+    the event is processed inside that session's dialogue: history is
+    loaded, the event becomes the latest user turn, and the answer is
+    recorded back. Otherwise it is processed stateless.
+    """
     req_id = req_id or uuid.uuid4().hex[:8]
     model = model or EVENT_MODEL or "qwen3:8b"
     options = merge_options(options)
 
-    # Normalize payload: it might be a raw string (from some downstream servers),
-    # or a dict with arbitrary structure. Ensure it's JSON-safe.
+    # Normalise payload to a dict. Wrapping lists preserves them without
+    # breaking the shape expected by downstream helpers and the journal.
     if not isinstance(event_payload, (dict, list)):
-        event_payload = {"text": str(event_payload)}
+        payload_dict: Dict[str, Any] = {"text": str(event_payload)}
+    elif isinstance(event_payload, list):
+        payload_dict = {"items": event_payload}
+    else:
+        payload_dict = event_payload
 
-    log.info("[%s] system event: type=%s source=%s model=%s",
-             req_id, event_type, event_source, model)
+    session_key = _extract_session_key(event_source, payload_dict)
 
-    _log_event_journal(req_id, event_type, event_source, event_payload)
+    # Idempotency: skip re-delivered events.
+    if session_key and _is_duplicate_event(session_key, payload_dict):
+        log.info("[%s] event deduplicated: session=%s", req_id, session_key)
+        _log_event_journal(req_id, event_type, event_source, payload_dict)
+        return req_id
+
+    log.info(
+        "[%s] system event: type=%s source=%s model=%s session=%s",
+        req_id, event_type, event_source, model,
+        session_key or "(stateless)",
+    )
+
+    _log_event_journal(req_id, event_type, event_source, payload_dict)
+
+    # Load (or create) session, if we have a key.
+    session = sess.get_session(session_key) if session_key else None
+
+    history: List[Dict[str, Any]] = []
+    if session is not None:
+        history = _load_session_history(session, MAX_HISTORY_TURNS)
+        log.info(
+            "[%s] loaded %d history message(s) for session %s",
+            req_id, len(history), session_key,
+        )
 
     event_text = (
         f"[SYSTEM EVENT] type={event_type} source={event_source}\n"
-        f"{json.dumps(event_payload, ensure_ascii=False, indent=2)}"
+        f"{json.dumps(payload_dict, ensure_ascii=False, indent=2)}"
         f"{_EVENT_DIRECTIVE}"
     )
-    messages: List[Dict[str, Any]] = [{"role": "user", "content": event_text}]
-    messages, layer_sizes = ensure_system_prompt(messages, session=None)
+
+    messages: List[Dict[str, Any]] = list(history)
+    messages.append({"role": "user", "content": event_text})
+
+    # Capture pre-RAG user text. Session log and RAG index must store what
+    # the human wrote, not the full event envelope.
+    human_text = _extract_event_human_text(payload_dict)
+    original_user = human_text or event_text
+
+    messages, layer_sizes = ensure_system_prompt(messages, session=session)
 
     def _run():
+        lock = _get_session_lock(session_key) if session_key else None
+        if lock is not None:
+            lock.acquire()
         try:
             answer = run_tool_loop(
                 model, messages, options, layer_sizes, req_id,
                 final_num_predict=EVENT_FINAL_ROUND_NUM_PREDICT,
             )
-            _log_event_journal(req_id, event_type, event_source, event_payload, answer)
+            if session is not None and answer:
+                try:
+                    sess.record_turn(session, original_user, answer)
+                    rag.index_turn(
+                        source=f"session:{session.session_id}",
+                        user=original_user,
+                        assistant=answer,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "[%s] failed to persist event turn to session %s: %s",
+                        req_id, session_key, e,
+                    )
+            _log_event_journal(
+                req_id, event_type, event_source, payload_dict, answer,
+            )
             log.info("[%s] event worker done, answer_len=%d", req_id, len(answer))
         except Exception:
             log.error("[%s] event worker error:\n%s", req_id, traceback.format_exc())
+        finally:
+            if lock is not None:
+                lock.release()
 
     t = threading.Thread(target=_run, daemon=True, name=f"event-{req_id}")
     t.start()
