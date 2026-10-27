@@ -500,14 +500,14 @@ def _planner() -> Dict[str, Any]:
     )
     obs_lines = []
     for o in observations:
-        ts = (o.get("Updated_At") or o.get("created_at") or "?")[:16]
+        ts = (o.get("updated_at") or o.get("created_at") or "?")[:16]
         kind = o.get("kind", "?")
         res = (o.get("last_result") or "").replace("\n", " ").strip()
         if len(res) > BG_OBSERVATION_SNIPPET_CHARS:
             res = res[:BG_OBSERVATION_SNIPPET_CHARS] + "..."
         age_h = _age_hours(o.get("updated_at") or o.get("created_at"))
-    obs_lines.append(f"- [{ts}, {age_h:.0f}h ago] ({kind}) {res}")
-    obs_block = "\n".join(obs_lines) if obs_lines else "(no observations yet)"
+        obs_lines.append(f"- [{ts}, {age_h:.0f}h ago] ({kind}) {res}")
+    obs_block = "\n".join(obs_lines) if obs_lines else "(no observations in the last 24h)"
 
     made_today = ledger.new_goals_created_today()
 
@@ -851,7 +851,6 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         ),
     })
     resp: Dict[str, Any] = {}
-    resp: Dict[str, Any] = {}
     try:
         # Keep tools in the payload to preserve the DeepSeek prefix cache.
         # The tool schema block is part of the cache key; stripping it here
@@ -1011,7 +1010,7 @@ def _apply_partial(g: Dict[str, Any], observation: str) -> None:
         BG_MAX_ATTEMPTS_PER_GOAL,  # reuse same cap semantics
     )
     g["partials"] = int(g.get("partials", 0)) + 1
-    now = now_iso()
+    now = ledger.now_iso()
     g["updated_at"] = now
     if observation:
         g["last_result"] = observation
@@ -1283,7 +1282,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             if g["status"] == "blocked":
                 reflector_needed = True
         elif outcome == "partial":
-            ledger.apply_partial(g, executor_result["observation"])
+            _apply_partial(g, executor_result["observation"])
             if g["status"] == "blocked":
                 reflector_needed = True
         else:
