@@ -304,6 +304,14 @@ BG_OBSERVATION_SNIPPET_CHARS: int = int(
     _env("BG_OBSERVATION_SNIPPET_CHARS", "250")
 )
 
+# Max age (hours) for an observation to be considered by the planner.
+# Older observations are still in the ledger but not shown to the model:
+# they describe a past state and the planner otherwise resurrects
+# already-fixed problems as new goals. 0 = no filter.
+BG_OBSERVATION_MAX_AGE_HOURS: float = float(
+    _env("BG_OBSERVATION_MAX_AGE_HOURS", "24")
+)
+
 # How many recent observations to show the planner.
 BG_RECENT_OBSERVATIONS_LIMIT: int = int(
     _env("BG_RECENT_OBSERVATIONS_LIMIT", "12")
@@ -339,10 +347,16 @@ def _load_bg_prompt(name: str) -> str:
             try:
                 text = p.read_text(encoding="utf-8").strip()
                 if text:
+                    log.info("prompt %s loaded from %s (%d chars)", name, p, len(text))
                     return text
             except Exception:
                 continue
-    return _env(f"BG_PROMPT_{name.upper()}", "")
+    env_val = _env(f"BG_PROMPT_{name.upper()}", "")
+    if env_val:
+        log.info("prompt %s loaded from env (%d chars)", name, len(env_val))
+    else:
+        log.info("prompt %s using code default", name)
+    return env_val
 
 
 # Wake-up mode for background phases.

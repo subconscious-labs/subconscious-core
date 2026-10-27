@@ -126,6 +126,12 @@ Bad "new" examples (do NOT do this):
 - "Monitor disk space" (not based on any observation)
 
 If you cannot point to a specific observation, return "skip".
+
+Observations are shown with their age. An observation older than a few
+hours describes a past state that may no longer hold. Do not create new
+goals based on stale observations: if the newest signal is old, prefer
+"skip" or pick an existing goal that already has fresh context. If you
+cannot point to a fresh observation, return "skip".
 """
 
 _DEFAULT_EXECUTOR_INSTRUCTIONS = """\
@@ -459,6 +465,18 @@ def _execute_tool_call(tc: Dict[str, Any]) -> Any:
 
 # ── Planner ───────────────────────────────────────────────────────────────────
 
+def _age_hours(ts: Optional[str]) -> float:
+    if not ts:
+        return 0.0
+    try:
+        dt = datetime.strptime(
+            ts[:19], "%Y-%m-%dT%H:%M:%S"
+        ).replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    except Exception:
+        return 0.0
+
+
 def _planner() -> Dict[str, Any]:
     model = BG_MODEL_PLANNER or BG_MODEL
     model, degrade_reason = ledger.resolve_model(model, "planner")
@@ -467,7 +485,10 @@ def _planner() -> Dict[str, Any]:
     cap = BG_MAX_OPEN_GOALS
 
     # Recent observations for context
-    observations = ledger.read_recent_observations(limit=BG_RECENT_OBSERVATIONS_LIMIT)
+    observations = ledger.read_recent_observations(
+        limit=BG_RECENT_OBSERVATIONS_LIMIT,
+        max_age_hours=BG_OBSERVATION_MAX_AGE_HOURS,
+    )
     obs_lines = []
     for o in observations:
         ts = (o.get("updated_at") or o.get("created_at") or "?")[:16]
@@ -475,7 +496,8 @@ def _planner() -> Dict[str, Any]:
         res = (o.get("last_result") or "").replace("\n", " ").strip()
         if len(res) > BG_OBSERVATION_SNIPPET_CHARS:
             res = res[:BG_OBSERVATION_SNIPPET_CHARS] + "..."
-        obs_lines.append(f"- [{ts}] ({kind}) {res}")
+        age_h = _age_hours(o.get("updated_at") or o.get("created_at"))
+    obs_lines.append(f"- [{ts}, {age_h:.0f}h ago] ({kind}) {res}")
     obs_block = "\n".join(obs_lines) if obs_lines else "(no observations yet)"
 
     made_today = ledger.new_goals_created_today()

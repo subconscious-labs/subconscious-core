@@ -404,27 +404,49 @@ def cancel_stale_exploratory(goals: List[Dict[str, Any]]) -> int:
 
 # ── recent-history readers (planner + exploratory accounting) ────────────────
 
-def read_recent_observations(limit: int = 12) -> List[Dict[str, Any]]:
-    """Recent observations from archive + active goals (planner context)."""
+def read_recent_observations(
+    limit: int = 12,
+    max_age_hours: float = 24.0,
+) -> List[Dict[str, Any]]:
+    """Recent observations from archive + active goals (planner context).
+
+    Observations older than max_age_hours are skipped: they describe
+    a past state that may no longer hold, and the planner would otherwise
+    resurrect already-fixed problems as new goals. Freshness matters more
+    than completeness here; the full history remains in the ledger.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     items: List[Dict[str, Any]] = []
+
+    def fresh(g: Dict[str, Any]) -> bool:
+        ts = g.get("updated_at") or g.get("created_at")
+        if not ts:
+            return False
+        try:
+            dt = datetime.strptime(
+                ts[:19], "%Y-%m-%dT%H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+        except Exception:
+            return False
+        return dt >= cutoff
 
     archive_path = goals_archive_path()
     if archive_path.exists():
         try:
             with archive_path.open("r", encoding="utf-8") as f:
-                lines = f.readlines()[-limit * 3:]
+                lines = f.readlines()[-limit * 6:]
             for line in lines:
                 try:
                     g = json.loads(line)
                 except Exception:
                     continue
-                if g.get("last_result"):
+                if g.get("last_result") and fresh(g):
                     items.append(g)
         except Exception as e:
             log.debug("archive read failed: %s", e)
 
     for g in read_goals().get("goals", []):
-        if g.get("last_result"):
+        if g.get("last_result") and fresh(g):
             items.append(g)
 
     items.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
