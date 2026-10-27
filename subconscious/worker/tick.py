@@ -60,35 +60,23 @@ from subconscious.runtime.config import (
     BG_OBSERVATION_SNIPPET_CHARS,
     BG_RECENT_OBSERVATIONS_LIMIT,
     BG_EXPLORATORY_PER_DAY,
-    BG_EXPLORATORY_TTL_HOURS,
-    BG_EXPLORATORY_MIN_INTERVAL_MIN,
     BG_PHASE_TIMEOUT,
     BG_PHASE_TIMEOUT_EXECUTOR,
     BG_PHASE_TIMEOUT_EXPLORATORY,
     BG_TICK_TIMEOUT,
-    BG_DAILY_TOKEN_BUDGET,
-    BG_DAILY_TIME_BUDGET_SEC,
-    BG_CLOUD_PREFIXES,
-    BG_CLOUD_DAILY_TOKEN_BUDGET,
-    BG_DEGRADE_MODEL,
     BG_NUM_PREDICT,
     BG_SESSION_ID,
-    BG_STATE_DIR,
     BG_TOOLS_ALLOWED,
     BG_MAX_NEW_GOALS_PER_DAY,
-    BG_JOURNAL_MAX_MB,
-    BG_JOURNAL_KEEP,
     BG_SKIP_WITH_OPEN_GOALS_STOPS_TICK,
     BG_PROMPT_PLANNER,
     BG_PROMPT_EXECUTOR,
     BG_PROMPT_EXPLORATORY,
     BG_PROMPT_REFLECTOR,
 )
+from subconscious.worker import ledger
 
-log = logging.getLogger("chatd.bg")
-
-GOALS_VERSION = 1
-BUDGET_VERSION = 1
+log = logging.getLogger("subconscious.worker.tick")
 
 # Read-only subset used for exploratory goals - intersection of any tool
 # list with these suffixes. Keeps the "read-only" promise even if the
@@ -216,233 +204,6 @@ _EXPLORATORY_SEED_PREFERENCE = [
 ]
 
 
-# ── paths ─────────────────────────────────────────────────────────────────────
-
-def _state_dir() -> Path:
-    p = Path(os.path.expanduser(BG_STATE_DIR))
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _goals_path() -> Path:
-    return _state_dir() / "goals.json"
-
-
-def _budget_path() -> Path:
-    return _state_dir() / "budget.json"
-
-
-def _journal_path() -> Path:
-    return _state_dir() / "journal.jsonl"
-
-
-def _lock_path() -> Path:
-    return _state_dir() / "tick.lock"
-
-
-def _goals_archive_path() -> Path:
-    return _state_dir() / "goals.archive.jsonl"
-
-
-def _new_goals_counter_path() -> Path:
-    return _state_dir() / "new_goals_counter.json"
-
-
-def _append_archive(goal: Dict[str, Any]) -> None:
-    """Append one done/cancelled goal to the archive (JSONL)."""
-    try:
-        with _goals_archive_path().open("a", encoding="utf-8") as f:
-            f.write(json.dumps(goal, ensure_ascii=False) + "\n")
-    except Exception as e:
-        log.warning("[bg] goals archive append failed: %s", e)
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
-
-
-def _today_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def _new_id() -> str:
-    return "g-" + uuid.uuid4().hex[:6]
-
-
-# ── atomic JSON I/O ───────────────────────────────────────────────────────────
-
-def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
-def _read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
-    if not path.exists():
-        return default
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log.warning("[bg] failed to read %s: %s - using default", path, e)
-        return default
-
-
-# ── journal ───────────────────────────────────────────────────────────────────
-
-def _rotate_journal_if_needed() -> None:
-    """Rotate journal.jsonl if it exceeds BG_JOURNAL_MAX_MB."""
-    if BG_JOURNAL_MAX_MB <= 0:
-        return
-    path = _journal_path()
-    if not path.exists():
-        return
-    try:
-        size_mb = path.stat().st_size / (1024 * 1024)
-        if size_mb < BG_JOURNAL_MAX_MB:
-            return
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        rotated = path.with_name(f"journal.{stamp}.jsonl")
-        os.rename(path, rotated)
-        log.info("[bg] journal rotated: %s -> %s (%.1f MB)",
-                 path.name, rotated.name, size_mb)
-        if BG_JOURNAL_KEEP > 0:
-            old = sorted(_state_dir().glob("journal.*.jsonl"))
-            for p in old[:-BG_JOURNAL_KEEP]:
-                try:
-                    p.unlink()
-                    log.debug("[bg] removed old journal: %s", p.name)
-                except Exception:
-                    pass
-    except Exception as e:
-        log.warning("[bg] journal rotation failed: %s", e)
-
-
-def _append_journal(entry: Dict[str, Any]) -> None:
-    try:
-        _rotate_journal_if_needed()
-        with _journal_path().open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        log.warning("[bg] journal append failed: %s", e)
-
-
-# ── lock ──────────────────────────────────────────────────────────────────────
-
-class TickLock:
-    def __init__(self, path: Path):
-        self.path = path
-        self._fd: Optional[int] = None
-
-    def acquire(self) -> bool:
-        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            os.close(self._fd)
-            self._fd = None
-            return False
-
-    def release(self) -> None:
-        if self._fd is not None:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-            finally:
-                os.close(self._fd)
-                self._fd = None
-
-
-# ── budget ────────────────────────────────────────────────────────────────────
-
-def _empty_budget() -> Dict[str, Any]:
-    return {
-        "version": BUDGET_VERSION,
-        "date": _today_utc(),
-        "tokens_used": 0,
-        "time_used_sec": 0,
-        "cloud_tokens_used": 0,
-    }
-
-
-def _read_budget() -> Dict[str, Any]:
-    b = _read_json(_budget_path(), _empty_budget())
-    if b.get("date") != _today_utc():
-        b = _empty_budget()
-        _atomic_write_json(_budget_path(), b)
-    return b
-
-
-def _budget_allows_new_tick() -> Optional[str]:
-    """Return a reason string if a new tick is not allowed, else None."""
-    if BG_DAILY_TOKEN_BUDGET <= 0 and BG_DAILY_TIME_BUDGET_SEC <= 0:
-        return None
-    b = _read_budget()
-    if BG_DAILY_TOKEN_BUDGET > 0 and b["tokens_used"] >= BG_DAILY_TOKEN_BUDGET:
-        return "daily_token_budget_exceeded"
-    if BG_DAILY_TIME_BUDGET_SEC > 0 and b["time_used_sec"] >= BG_DAILY_TIME_BUDGET_SEC:
-        return "daily_time_budget_exceeded"
-    return None
-
-
-def _budget_add_llm(tokens: int, is_cloud: bool) -> None:
-    """Called after each LLM call. Updates token counters.
-
-    Cloud tokens are always counted (so the operator can observe usage even
-    without a budget); total tokens are also tracked for BG_DAILY_TOKEN_BUDGET.
-    """
-    if tokens <= 0:
-        return
-    b = _read_budget()
-    b["tokens_used"] = int(b.get("tokens_used", 0)) + int(tokens)
-    if is_cloud:
-        b["cloud_tokens_used"] = int(b.get("cloud_tokens_used", 0)) + int(tokens)
-    _atomic_write_json(_budget_path(), b)
-
-
-def _budget_add_time(elapsed_sec: float) -> None:
-    """Called once per tick. Updates the time counter."""
-    if BG_DAILY_TIME_BUDGET_SEC <= 0:
-        return
-    b = _read_budget()
-    b["time_used_sec"] = int(b.get("time_used_sec", 0)) + int(elapsed_sec)
-    _atomic_write_json(_budget_path(), b)
-
-
-def _is_cloud(model: str) -> bool:
-    """Return True if *model* is a cloud model (prefix match)."""
-    return any(model.startswith(p) for p in BG_CLOUD_PREFIXES)
-
-
-def _resolve_model(model: str, phase: str) -> tuple[str, Optional[str]]:
-    """Return (effective_model, degrade_reason).
-
-    If *model* is a cloud model and the cloud daily token budget is
-    exhausted, replace it with BG_DEGRADE_MODEL (or BG_MODEL). Otherwise
-    return as-is with degrade_reason=None.
-    """
-    if not _is_cloud(model):
-        return model, None
-    if BG_CLOUD_DAILY_TOKEN_BUDGET <= 0:
-        return model, None
-    b = _read_budget()
-    used = int(b.get("cloud_tokens_used", 0))
-    if used < BG_CLOUD_DAILY_TOKEN_BUDGET:
-        return model, None
-    fallback = BG_DEGRADE_MODEL or BG_MODEL
-    reason = (
-        f"cloud budget exhausted ({used}/{BG_CLOUD_DAILY_TOKEN_BUDGET} tokens), "
-        f"degraded {phase} to {fallback}"
-    )
-    log.info("[bg %s] %s", phase, reason)
-    return fallback, reason
-
-
-
-
 # ── phase timeout helper ──────────────────────────────────────────────────────
 
 def _run_with_timeout(fn, timeout_sec: int, *args, **kwargs):
@@ -463,185 +224,6 @@ def _run_with_timeout(fn, timeout_sec: int, *args, **kwargs):
     if box["error"] is not None:
         raise box["error"]
     return box["result"]
-
-
-# ── goals ledger ──────────────────────────────────────────────────────────────
-
-def _empty_goals() -> Dict[str, Any]:
-    return {"version": GOALS_VERSION, "updated_at": _now_iso(), "goals": []}
-
-
-def _read_goals() -> Dict[str, Any]:
-    g = _read_json(_goals_path(), _empty_goals())
-    if not isinstance(g.get("goals"), list):
-        g["goals"] = []
-    return g
-
-
-def _write_goals(g: Dict[str, Any]) -> None:
-    """Persist goals. Active/pending/blocked stay in goals.json;
-    done/cancelled get appended to goals.archive.jsonl and removed
-    from the active file.
-    """
-    active = []
-    for goal in g.get("goals", []):
-        if goal.get("status") in ("done", "cancelled"):
-            _append_archive(goal)
-        else:
-            active.append(goal)
-    g["goals"] = active
-    g["updated_at"] = _now_iso()
-    _atomic_write_json(_goals_path(), g)
-
-
-def _read_new_goals_counter() -> Dict[str, Any]:
-    c = _read_json(_new_goals_counter_path(), {"date": _today_utc(), "count": 0})
-    if c.get("date") != _today_utc():
-        c = {"date": _today_utc(), "count": 0}
-    return c
-
-
-def _increment_new_goals_counter() -> None:
-    c = _read_new_goals_counter()
-    c["count"] = int(c.get("count", 0)) + 1
-    c["date"] = _today_utc()
-    _atomic_write_json(_new_goals_counter_path(), c)
-
-
-def _new_goals_created_today() -> int:
-    return int(_read_new_goals_counter().get("count", 0))
-
-
-def _read_recent_observations(limit: int = 12) -> List[Dict[str, Any]]:
-    """Return the most recent observations from archive + active goals.
-
-    Used to give the planner context about what it has noticed before.
-    """
-    items: List[Dict[str, Any]] = []
-
-    archive_path = _goals_archive_path()
-    if archive_path.exists():
-        try:
-            with archive_path.open("r", encoding="utf-8") as f:
-                lines = f.readlines()[-limit * 3:]
-            for line in lines:
-                try:
-                    g = json.loads(line)
-                except Exception:
-                    continue
-                if g.get("last_result"):
-                    items.append(g)
-        except Exception as e:
-            log.debug("[bg] archive read failed: %s", e)
-
-    for g in _read_goals().get("goals", []):
-        if g.get("last_result"):
-            items.append(g)
-
-    items.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-    return items[:limit]
-
-
-def _open_goals(goals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [g for g in goals if g.get("status") in ("pending", "active")]
-
-
-def _active_exploratory(goals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [g for g in goals
-            if g.get("kind") == "exploratory"
-            and g.get("status") in ("pending", "active")]
-
-
-def _exploratory_created_today(goals: List[Dict[str, Any]]) -> int:
-    prefix = _today_utc()[:10]
-    return sum(
-        1 for g in goals
-        if g.get("kind") == "exploratory"
-        and (g.get("created_at") or "").startswith(prefix)
-    )
-
-
-def _last_exploratory_timestamp(goals: List[Dict[str, Any]]) -> Optional[datetime]:
-    """Return the most recent created_at among exploratory goals, or None."""
-    latest: Optional[datetime] = None
-    for g in goals:
-        if g.get("kind") != "exploratory":
-            continue
-        created = g.get("created_at")
-        if not created:
-            continue
-        try:
-            ts = datetime.strptime(
-                created[:19], "%Y-%m-%dT%H:%M:%S"
-            ).replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-        if latest is None or ts > latest:
-            latest = ts
-    return latest
-
-
-def _exploratory_min_interval_ok(goals: List[Dict[str, Any]]) -> bool:
-    """Return True if enough time has passed since the last exploratory."""
-    if BG_EXPLORATORY_MIN_INTERVAL_MIN <= 0:
-        return True
-    last = _last_exploratory_timestamp(goals)
-    if last is None:
-        return True
-    elapsed_min = (datetime.now(timezone.utc) - last).total_seconds() / 60.0
-    return elapsed_min >= BG_EXPLORATORY_MIN_INTERVAL_MIN
-
-
-def _new_goal(title: str, kind: str) -> Dict[str, Any]:
-    now = _now_iso()
-    return {
-        "id": _new_id(),
-        "kind": kind,
-        "title": title.strip()[:300] or "(untitled)",
-        "status": "pending",
-        "attempts": 0,
-        "created_at": now,
-        "updated_at": now,
-        "last_result": None,
-        "history": [{"ts": now, "event": "created", "by": "system"}],
-    }
-
-
-def _find_goal(goals: List[Dict[str, Any]], goal_id: str) -> Optional[Dict[str, Any]]:
-    for g in goals:
-        if g.get("id") == goal_id:
-            return g
-    return None
-
-
-def _cancel_stale_exploratory(goals: List[Dict[str, Any]]) -> int:
-    """Auto-cancel exploratory goals older than BG_EXPLORATORY_TTL_HOURS."""
-    if BG_EXPLORATORY_TTL_HOURS <= 0:
-        return 0
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=BG_EXPLORATORY_TTL_HOURS)
-    changed = 0
-    for g in goals:
-        if g.get("kind") != "exploratory":
-            continue
-        if g.get("status") not in ("pending", "active"):
-            continue
-        try:
-            created = datetime.strptime(
-                g["created_at"][:19], "%Y-%m-%dT%H:%M:%S"
-            ).replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-        if created < cutoff:
-            g["status"] = "cancelled"
-            g["updated_at"] = _now_iso()
-            g.setdefault("history", []).append({
-                "ts": g["updated_at"],
-                "event": "cancelled",
-                "by": "system",
-                "note": "exploratory TTL expired",
-            })
-            changed += 1
-    return changed
 
 
 # ── LLM primitive ─────────────────────────────────────────────────────────────
@@ -697,7 +279,7 @@ def _llm_call(
         + int(usage.get("completion_tokens") or 0)
     )
     if tokens > 0:
-        _budget_add_llm(tokens, _is_cloud(model))
+        ledger.budget_add_llm(tokens, _is_cloud(model))
     return {
         "content":    msg.get("content") or "",
         "thinking":   thinking,
@@ -839,65 +421,15 @@ def _execute_tool_call(tc: Dict[str, Any]) -> Any:
 
 # ── Planner ───────────────────────────────────────────────────────────────────
 
-def _read_recent_normal_goals(limit: int = 5) -> List[Dict[str, Any]]:
-    items = []
-    archive_path = _goals_archive_path()
-    if archive_path.exists():
-        try:
-            with archive_path.open("r", encoding="utf-8") as f:
-                tail = deque(f, maxlen=limit * 3)
-                for line in tail:
-                    try:
-                        g = json.loads(line)
-                    except Exception:
-                        continue
-                    if g.get("kind") == "normal":
-                        items.append(g)
-        except Exception:
-            pass
-    for g in _read_goals().get("goals", []):
-        if g.get("kind") == "normal":
-            items.append(g)
-    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return items[:limit]
-
-
-def _read_recent_archive(limit: int = 30) -> List[Dict[str, Any]]:
-    """Return the last `limit` entries from goals.archive.jsonl.
-
-    Used by exploratory accounting, which must see completed goals too -
-    otherwise daily cap and min-interval reset every time an exploratory
-    finishes and moves to the archive.
-    """
-    items: List[Dict[str, Any]] = []
-    path = _goals_archive_path()
-    if not path.exists():
-        return items
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            tail = deque(f, maxlen=limit)
-        for line in tail:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                items.append(json.loads(line))
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return items
-
-
 def _planner() -> Dict[str, Any]:
     model = BG_MODEL_PLANNER or BG_MODEL
-    model, degrade_reason = _resolve_model(model, "planner")
-    goals = _read_goals()
-    open_list = _open_goals(goals["goals"])
+    model, degrade_reason = ledger.resolve_model(model, "planner")
+    goals = ledger.read_goals()
+    open_list = ledger.open_goals(goals["goals"])
     cap = BG_MAX_OPEN_GOALS
 
     # Recent observations for context
-    observations = _read_recent_observations(limit=BG_RECENT_OBSERVATIONS_LIMIT)
+    observations = ledger.read_recent_observations(limit=BG_RECENT_OBSERVATIONS_LIMIT)
     obs_lines = []
     for o in observations:
         ts = (o.get("updated_at") or o.get("created_at") or "?")[:16]
@@ -908,12 +440,12 @@ def _planner() -> Dict[str, Any]:
         obs_lines.append(f"- [{ts}] ({kind}) {res}")
     obs_block = "\n".join(obs_lines) if obs_lines else "(no observations yet)"
 
-    made_today = _new_goals_created_today()
+    made_today = ledger.new_goals_created_today()
 
     # Recent normal goals - to prevent duplicate proposals. We look at
     # the last 5 created normal goals regardless of status, because a
     # completed investigation shouldn't be repeated.
-    recent_normal = _read_recent_normal_goals(limit=5)
+    recent_normal = ledger.read_recent_normal_goals(limit=5)
     recent_titles = "\n".join(
         f"- {g.get('title', '?')}" for g in recent_normal
     ) or "(none)"
@@ -988,7 +520,7 @@ def _planner() -> Dict[str, Any]:
             decision = {"decision": "skip", "reason": "new goal without title"}
             d = "skip"
 
-    if d == "pick" and not _find_goal(goals["goals"], decision.get("goal_id", "")):
+    if d == "pick" and not ledger.find_goal(goals["goals"], decision.get("goal_id", "")):
         log.info("[bg planner] 'pick' with unknown goal_id - downgrading to skip")
         decision = {"decision": "skip", "reason": "unknown goal_id"}
         d = "skip"
@@ -1019,10 +551,6 @@ def _exploratory_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, An
         if name in by_name:
             return by_name[name]
     return tools[0] if tools else None
-
-
-def _seed_state_path() -> Path:
-    return _state_dir() / "seed_rotation.json"
 
 
 def _tool_needs_args(tool: Dict[str, Any]) -> bool:
@@ -1065,9 +593,9 @@ def _pick_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     ]
     available = preferred + rest
 
-    state = _read_json(_seed_state_path(), {"last_index": -1})
+    state = ledger.read_json(ledger.seed_state_path(), {"last_index": -1})
     idx = (int(state.get("last_index", -1)) + 1) % len(available)
-    _atomic_write_json(_seed_state_path(), {"last_index": idx})
+    ledger.atomic_write_json(ledger.seed_state_path(), {"last_index": idx})
 
     picked = available[idx]
     log.info("[bg executor] exploratory seed rotation: idx=%d/%d tool=%s",
@@ -1363,7 +891,7 @@ def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
 # ── ledger update helpers ─────────────────────────────────────────────────────
 
 def _apply_goal_update(g: Dict[str, Any], status: str, last_result: Optional[str]) -> None:
-    now = _now_iso()
+    now = ledger.now_iso()
     g["status"] = status
     g["updated_at"] = now
     if last_result is not None:
@@ -1396,7 +924,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     started = time.time()
     tick_deadline = started + BG_TICK_TIMEOUT
 
-    _append_journal({
+    ledger.append_journal({
         "req_id": req_id,
         "ts": _now_iso(),
         "session": BG_SESSION_ID,
@@ -1405,10 +933,10 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     })
 
     # Ledger hygiene: TTL for exploratory goals.
-    goals = _read_goals()
-    cancelled = _cancel_stale_exploratory(goals["goals"])
+    goals = ledger.read_goals()
+    cancelled = ledger.cancel_stale_exploratory(goals["goals"])
     if cancelled:
-        _write_goals(goals)
+        ledger.write_goals(goals)
         log.info("[bg %s] cancelled %d stale exploratory goal(s)",
                  req_id, cancelled)
 
@@ -1418,21 +946,21 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     # `skip` and then discover there's already a pending exploratory. Take
     # the existing goal directly - this is deterministic and saves a full
     # planner round.
-    goals = _read_goals()
-    existing_expl = _active_exploratory(goals["goals"])
+    goals = ledger.read_goals()
+    existing_expl = ledger.active_exploratory(goals["goals"])
 
     if existing_expl:
         picked_goal = existing_expl[0]
         picked_goal["status"] = "active"
-        picked_goal["updated_at"] = _now_iso()
+        picked_goal["updated_at"] = ledger.now_iso()
         picked_goal.setdefault("history", []).append({
             "ts": picked_goal["updated_at"],
             "event": "status=active",
             "by": "system",
             "note": "auto-resume",
         })
-        _write_goals(goals)
-        _append_journal({
+        ledger.write_goals(goals)
+        ledger.append_journal({
             "req_id": req_id,
             "ts": _now_iso(),
             "phase": "planner",
@@ -1448,16 +976,16 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         # do not spend 2.5 minutes on it. The planner can only act on
         # pending open goals or create a new exploratory - if neither is
         # possible, skip outright.
-        goals_now = _read_goals()
-        open_now = _open_goals(goals_now["goals"])
-        combined = goals_now["goals"] + _read_recent_archive()
-        made_today = _exploratory_created_today(combined)
+        goals_now = ledger.read_goals()
+        open_now = ledger.open_goals(goals_now["goals"])
+        combined = goals_now["goals"] + ledger.read_recent_archive()
+        made_today = ledger.exploratory_created_today(combined)
         if not open_now and made_today >= BG_EXPLORATORY_PER_DAY:
             log.info("[bg %s] short-circuit: no open goals, exploratory cap "
                      "reached (%d/%d)", req_id, made_today,
                      BG_EXPLORATORY_PER_DAY)
-            _append_journal({
-                "req_id": req_id, "ts": _now_iso(),
+            ledger.append_journal({
+                "req_id": req_id, "ts": ledger.now_iso(),
                 "status": "skipped",
                 "reason": "no_open_goals_and_exploratory_cap_reached",
             })
@@ -1471,9 +999,9 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         planner_result = _run_with_timeout(_planner, BG_PHASE_TIMEOUT)
         tokens_used = planner_result["tokens"]
         decision = planner_result["decision"]
-        _append_journal({
+        ledger.append_journal({
             "req_id": req_id,
-            "ts": _now_iso(),
+            "ts": ledger.now_iso(),
             "phase": "planner",
             "model": planner_result["model"],
             "degraded": planner_result.get("degraded"),
@@ -1481,40 +1009,40 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         })
         log.info("[bg %s] planner: %s", req_id, decision.get("decision"))
 
-        goals = _read_goals()
+        goals = ledger.read_goals()
         picked_goal: Optional[Dict[str, Any]] = None
         d = decision.get("decision")
 
         if d == "new":
-            open_count = len(_open_goals(goals["goals"]))
+            open_count = len(ledger.open_goals(goals["goals"]))
             if open_count >= BG_MAX_OPEN_GOALS:
                 log.info("[bg %s] new-goal blocked at ledger stage", req_id)
             else:
-                g = _new_goal(decision.get("title", ""), kind="normal")
+                g = ledger.new_goal(decision.get("title", ""), kind="normal")
                 if decision.get("based_on"):
                     g["based_on"] = decision["based_on"]
                 goals["goals"].append(g)
                 g["status"] = "active"
-                g["updated_at"] = _now_iso()
+                g["updated_at"] = ledger.now_iso()
                 g.setdefault("history", []).append(
                     {"ts": g["updated_at"], "event": "status=active",
                      "by": "planner"}
                 )
                 picked_goal = g
-                _increment_new_goals_counter()
-                _write_goals(goals)
+                ledger.increment_new_goals_counter()
+                ledger.write_goals(goals)
 
         elif d == "pick":
-            g = _find_goal(goals["goals"], decision.get("goal_id", ""))
+            g = ledger.find_goal(goals["goals"], decision.get("goal_id", ""))
             if g is not None:
                 g["status"] = "active"
-                g["updated_at"] = _now_iso()
+                g["updated_at"] = ledger.now_iso()
                 g.setdefault("history", []).append(
                     {"ts": g["updated_at"], "event": "status=active",
                      "by": "planner"}
                 )
                 picked_goal = g
-                _write_goals(goals)
+                ledger.write_goals(goals)
 
     # Remaining tick budget
     remaining = int(max(30, tick_deadline - time.time()))
@@ -1527,15 +1055,15 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     if (picked_goal is None
             and BG_SKIP_WITH_OPEN_GOALS_STOPS_TICK
             and decision.get("decision") == "skip"):
-        goals_now = _read_goals()
-        open_now = _open_goals(goals_now["goals"])
+        goals_now = ledger.read_goals()
+        open_now = ledger.open_goals(goals_now["goals"])
         if open_now:
             log.info(
                 "[bg %s] planner skipped with %d open goals - stopping",
                 req_id, len(open_now),
             )
-            _append_journal({
-                "req_id": req_id, "ts": _now_iso(),
+            ledger.append_journal({
+                "req_id": req_id, "ts": ledger.now_iso(),
                 "status": "skipped",
                 "reason": "planner_skipped_with_open_goals",
                 "open_count": len(open_now),
@@ -1549,9 +1077,9 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
 
     # ── Executor - runs picked goal, or explores read-only ─────────────
     if picked_goal is None:
-        goals = _read_goals()
-        combined = goals["goals"] + _read_recent_archive()
-        made_today = _exploratory_created_today(combined)
+        goals = ledger.read_goals()
+        combined = goals["goals"] + ledger.read_recent_archive()
+        made_today = ledger.exploratory_created_today(combined)
         if made_today >= BG_EXPLORATORY_PER_DAY:
             log.info("[bg %s] exploratory cap reached (%d/%d)",
                      req_id, made_today, BG_EXPLORATORY_PER_DAY)
@@ -1560,7 +1088,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 "status": "skipped",
                 "reason": "exploratory_cap_reached",
             }
-        if not _exploratory_min_interval_ok(combined):
+        if not ledger.exploratory_min_interval_ok(combined):
             log.info("[bg %s] exploratory min interval not elapsed "
                      "(%d min required)",
                      req_id, BG_EXPLORATORY_MIN_INTERVAL_MIN)
@@ -1571,14 +1099,14 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             }
         # Note: no need to check _active_exploratory here - if there was an
         # active one, we would have auto-resumed it above.
-        exp_goal = _new_goal("(exploratory tick)", kind="exploratory")
+        exp_goal = ledger.new_goal("(exploratory tick)", kind="exploratory")
         exp_goal["status"] = "active"
         exp_goal.setdefault("history", []).append(
             {"ts": exp_goal["updated_at"], "event": "status=active",
              "by": "planner"}
         )
         goals["goals"].append(exp_goal)
-        _write_goals(goals)
+        ledger.write_goals(goals)
         picked_goal = exp_goal
 
     if picked_goal["kind"] == "exploratory":
@@ -1592,12 +1120,12 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         )
     except TimeoutError as e:
         log.warning("[bg %s] executor timeout: %s", req_id, e)
-        goals = _read_goals()
-        g = _find_goal(goals["goals"], picked_goal["id"])
+        goals = ledger.read_goals()
+        g = ledger.find_goal(goals["goals"], picked_goal["id"])
         if g is not None:
             _apply_failure(g, "executor timeout")
-            _write_goals(goals)
-        _append_journal({
+            ledger.write_goals(goals)
+        ledger.append_journal({
             "req_id": req_id, "ts": _now_iso(),
             "phase": "executor", "status": "timeout", "error": str(e),
         })
@@ -1621,9 +1149,9 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 f"executor made no tool calls ({picked_goal['kind']})"
 
     tokens_used += executor_result["tokens"]
-    _append_journal({
+    ledger.append_journal({
         "req_id": req_id,
-        "ts": _now_iso(),
+        "ts": ledger.now_iso(),
         "phase": "executor",
         "model": executor_result["model"],
         "degraded": executor_result.get("degraded"),
@@ -1635,7 +1163,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
 
     # Persist executor result
     goals = _read_goals()
-    g = _find_goal(goals["goals"], picked_goal["id"])
+    g = ledger.find_goal(goals["goals"], picked_goal["id"])
     reflector_needed = False
     if g is not None:
         if executor_result["outcome"] == "failed":
@@ -1652,7 +1180,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 executor_result["observation"],
             )
 
-        open_count = len(_open_goals(goals["goals"]))
+        open_count = len(ledger.open_goals(goals["goals"]))
         added = 0
         for title in executor_result["new_goals"]:
             if open_count + added >= BG_MAX_OPEN_GOALS:
@@ -1662,7 +1190,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             goals["goals"].append(_new_goal(title, kind="normal"))
             added += 1
 
-        _write_goals(goals)
+        ledger.write_goals(goals)
 
     # Reflector - only on blocked goal with attempts >= cap.
     if reflector_needed and g is not None:
@@ -1679,15 +1207,15 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                         "tokens": 0}
 
             tokens_used += refl["tokens"]
-            _append_journal({
-                "req_id": req_id, "ts": _now_iso(),
+            ledger.append_journal({
+                "req_id": req_id, "ts": ledger.now_iso(),
                 "phase": "reflector", "model": refl["model"],
                 "degraded": refl.get("degraded"),
                 "decision": refl["decision"], "tokens": refl["tokens"],
             })
 
-            goals = _read_goals()
-            g = _find_goal(goals["goals"], picked_goal["id"])
+            goals = ledger.read_goals()
+            g = ledger.find_goal(goals["goals"], picked_goal["id"])
             if g is not None:
                 now = _now_iso()
                 if refl["decision"] == "retry":
@@ -1704,10 +1232,10 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                     "by": "reflector",
                     "note": refl.get("reason", ""),
                 })
-                _write_goals(goals)
+                ledger.write_goals(goals)
 
     elapsed = time.time() - started
-    _budget_add_time(elapsed)
+    ledger.budget_add_time(elapsed)
 
     result = {
         "req_id": req_id,
@@ -1720,8 +1248,8 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         "elapsed_ms": int(elapsed * 1000),
         "useful": executor_result.get("useful"),
     }
-    _append_journal({
-        "req_id": req_id, "ts": _now_iso(),
+    ledger.append_journal({
+        "req_id": req_id, "ts": ledger.now_iso(),
         "status": "done", "result": result,
     })
     log.info("[bg %s] tick done: goal=%s outcome=%s tokens=%d elapsed=%dms",
@@ -1732,22 +1260,22 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
 
 def run_tick(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     """One tick. Returns a JSON-serialisable result dict."""
-    lock = TickLock(_lock_path())
+    lock = ledger.TickLock(_lock_path())
     if not lock.acquire():
         log.info("[bg %s] tick skipped - previous tick still running", req_id)
-        _append_journal({
-            "req_id": req_id, "ts": _now_iso(),
+        ledger.append_journal({
+            "req_id": req_id, "ts": ledger.now_iso(),
             "status": "skipped", "reason": "tick_already_running",
         })
         return {"req_id": req_id, "status": "skipped",
                 "reason": "tick_already_running"}
 
     try:
-        reason = _budget_allows_new_tick()
+        reason = ledger.budget_allows_new_tick()
         if reason:
             log.info("[bg %s] tick skipped - %s", req_id, reason)
-            _append_journal({
-                "req_id": req_id, "ts": _now_iso(),
+            ledger.append_journal({
+                "req_id": req_id, "ts": ledger.now_iso(),
                 "status": "skipped", "reason": reason,
             })
             return {"req_id": req_id, "status": "skipped", "reason": reason}
@@ -1756,16 +1284,16 @@ def run_tick(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
 
     except TimeoutError as e:
         log.warning("[bg %s] tick timeout: %s", req_id, e)
-        _append_journal({
-            "req_id": req_id, "ts": _now_iso(),
+        ledger.append_journal({
+            "req_id": req_id, "ts": ledger.now_iso(),
             "status": "timeout", "error": str(e),
         })
         return {"req_id": req_id, "status": "timeout", "error": str(e)}
 
     except Exception as e:
         log.error("[bg %s] tick error: %s", req_id, e, exc_info=True)
-        _append_journal({
-            "req_id": req_id, "ts": _now_iso(),
+        ledger.append_journal({
+            "req_id": req_id, "ts": ledger.now_iso(),
             "status": "error", "error": str(e),
         })
         raise

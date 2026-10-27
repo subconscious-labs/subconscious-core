@@ -23,7 +23,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-log = logging.getLogger("chatd.internal_tools")
+from subconscious.runtime.config import BG_MAX_OPEN_GOALS
+from subconscious.worker import ledger
+
+
+log = logging.getLogger("subconscious.tools.internal")
 
 
 # ── schemas ───────────────────────────────────────────────────────────────────
@@ -261,8 +265,7 @@ def _compact_goal(g: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _read_archive_all() -> List[Dict[str, Any]]:
-    from subconscious.worker import tick as background
-    path = background._goals_archive_path()
+    path = ledger.goals_archive_path()
     if not path.exists():
         return []
     out: List[Dict[str, Any]] = []
@@ -282,15 +285,14 @@ def _read_archive_all() -> List[Dict[str, Any]]:
 
 
 def _acquire_ledger_lock(timeout_sec: float = 5.0):
-    """Acquire TickLock with a short retry loop.
+    """Acquire the tick lock with a short retry loop.
 
-    Returns the lock on success, None if a tick is running. We intentionally
-    reuse TickLock - it already serializes run_tick, and one lock for
-    "background state writes" is simpler than two.
+    Returns the lock on success, None if a tick is running. We reuse the
+    same lock that run_tick holds - one lock for "background state
+    writes" is simpler than two.
     """
-    from subconscious.worker import tick as background
     deadline = time.time() + timeout_sec
-    lock = background.TickLock(background._lock_path())
+    lock = ledger.TickLock(ledger.lock_path())
     while time.time() < deadline:
         if lock.acquire():
             return lock
@@ -301,14 +303,12 @@ def _acquire_ledger_lock(timeout_sec: float = 5.0):
 # ── implementations ───────────────────────────────────────────────────────────
 
 def _list_goals(args: Dict[str, Any]) -> Dict[str, Any]:
-    from subconscious.worker import tick as background
-
     status_filter = (args.get("status") or "open").lower()
     kind_filter   = (args.get("kind") or "all").lower()
     limit         = int(args.get("limit") or 20)
     limit         = max(1, min(limit, 100))
 
-    active   = background._read_goals().get("goals", [])
+    active   = ledger.read_goals().get("goals", [])
     archived = _read_archive_all()
     everything = active + archived
 
@@ -339,14 +339,12 @@ def _list_goals(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _get_goal(args: Dict[str, Any]) -> Dict[str, Any]:
-    from subconscious.worker import tick as background
-
     goal_id = (args.get("goal_id") or "").strip()
     if not goal_id:
         return {"error": "goal_id is required"}
 
-    g = background._find_goal(
-        background._read_goals().get("goals", []), goal_id
+    g = ledger.find_goal(
+        ledger.read_goals().get("goals", []), goal_id
     )
     if g is None:
         for entry in _read_archive_all():
@@ -359,8 +357,6 @@ def _get_goal(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _create_goal(args: Dict[str, Any]) -> Dict[str, Any]:
-    from subconscious.worker import tick as background
-
     title = (args.get("title") or "").strip()
     if not title:
         return {"error": "title is required"}
@@ -379,29 +375,27 @@ def _create_goal(args: Dict[str, Any]) -> Dict[str, Any]:
             "error": "background tick is running; try again in a minute"
         }
     try:
-        goals = background._read_goals()
-        open_count = len(background._open_goals(goals.get("goals", [])))
-        if open_count >= background.BG_MAX_OPEN_GOALS:
+        goals = ledger.read_goals()
+        open_count = len(ledger.open_goals(goals.get("goals", [])))
+        if open_count >= ledger.BG_MAX_OPEN_GOALS:
             return {
                 "error": (
                     f"open-goal cap reached "
-                    f"({open_count}/{background.BG_MAX_OPEN_GOALS})"
+                    f"({open_count}/{ledger.BG_MAX_OPEN_GOALS})"
                 )
             }
-        new_g = background._new_goal(title, kind="normal")
+        new_g = ledger.new_goal(title, kind="normal")
         if based_on:
             new_g["based_on"] = based_on
         goals.setdefault("goals", []).append(new_g)
-        background._increment_new_goals_counter()
-        background._write_goals(goals)
+        ledger.increment_new_goals_counter()
+        ledger.write_goals(goals)
         return {"created": new_g}
     finally:
         lock.release()
 
 
 def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
-    from subconscious.worker import tick as background
-
     ids: List[str] = []
     single = (args.get("goal_id") or "").strip()
     if single:
@@ -421,14 +415,14 @@ def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
     if lock is None:
         return {"error": "background tick is running; try again in a minute"}
     try:
-        goals = background._read_goals()
-        now = _iso()
+        goals = ledger.read_goals()
+        now = ledger.iso()
         cancelled: List[Dict[str, Any]] = []
         not_found: List[str] = []
         already_closed: List[Dict[str, str]] = []
 
         for gid in ids:
-            target = background._find_goal(goals.get("goals", []), gid)
+            target = ledger.find_goal(goals.get("goals", []), gid)
             if target is None:
                 not_found.append(gid)
                 continue
@@ -448,7 +442,7 @@ def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
             cancelled.append(_compact_goal(target))
 
         if cancelled:
-            background._write_goals(goals)
+            ledger.write_goals(goals)
 
         return {
             "cancelled_count": len(cancelled),
@@ -461,13 +455,12 @@ def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _journal_tail(args: Dict[str, Any]) -> Dict[str, Any]:
-    from subconscious.worker import tick as background
     from collections import deque
 
     n = int(args.get("n") or 20)
     n = max(1, min(n, 100))
 
-    path = background._journal_path()
+    path = ledger.journal_path()
     if not path.exists():
         return {"count": 0, "entries": []}
 
