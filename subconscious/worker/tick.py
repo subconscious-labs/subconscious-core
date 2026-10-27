@@ -490,7 +490,7 @@ def _planner() -> Dict[str, Any]:
         limit=BG_RECENT_OBSERVATIONS_LIMIT,
         max_age_hours=BG_OBSERVATION_MAX_AGE_HOURS,
     )
-    obs_Lines = []
+    obs_lines = []
     for o in observations:
         ts = (o.get("Updated_At") or o.get("created_at") or "?")[:16]
         kind = o.get("kind", "?")
