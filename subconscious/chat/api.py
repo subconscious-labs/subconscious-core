@@ -97,8 +97,9 @@ _EVENT_DIRECTIVE = (
     "\n"
     "STEP 4 - Persist (only for important events):\n"
     "  If this event is an alert, a security issue, or an anomaly, save a brief\n"
-    "  summary to long-term memory using `mempalace_add_drawer` or `mempalace_kg_add`,\n"
-    "  so you can recall it later if asked.\n"
+    "  summary to long-term memory. Use meta_search to locate the appropriate\n"
+    "  memory tool (mempalace_* via meta_call) - direct mempalace tools may\n"
+    "  not be registered on this install.\n"
     "\n"
     "Do NOT skip STEP 1. Do NOT write a plain-text summary without calling send_message."
 )

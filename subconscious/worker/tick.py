@@ -723,9 +723,25 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         useful = parsed.get("useful")
         if not isinstance(useful, bool):
             useful = None
+
         observation = str(parsed.get("observation") or "").strip()
+
         if not observation:
-            observation = "(empty observation)"
+        # JSON parse failed or observation field missing. Give the ledger
+        # something actionable instead of an empty string that Reflector
+        # cannot reason about.
+        raw_preview = (resp.get("content") or "")[:200].strip()
+        if raw_preview:
+            observation = (
+                f"executor produced no JSON summary; raw response preview: "
+                f"{raw_preview!r}"
+            )
+        else:
+            observation = (
+                f"executor returned empty content (finish_reason="
+                f"{resp.get('done_reason', '?')}, model={model})"
+            )
+
         new_goals = []
         raw = parsed.get("new_goals") or []
         if isinstance(raw, list):
@@ -814,6 +830,22 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
     ) else "failed"
 
     observation = str(parsed.get("observation") or "").strip()
+    if not observation:
+        # JSON parse failed or observation field missing. Give the ledger
+        # something actionable instead of an empty string that Reflector
+        # cannot reason about.
+        raw_preview = (resp.get("content") or "")[:200].strip()
+        if raw_preview:
+            observation = (
+                f"executor produced no JSON summary; raw response preview: "
+                f"{raw_preview!r}"
+            )
+        else:
+            observation = (
+                f"executor returned empty content (finish_reason="
+                f"{resp.get('done_reason', '?')}, model={model})"
+            )
+
     upd = parsed.get("goal_updates") or {}
     new_status = upd.get("status") if upd.get("status") in (
         "done", "partial", "blocked"
