@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
-log = logging.getLogger("subconscious.runtime.config")
+_env_log = logging.getLogger("subconscious.runtime.config")
 _env_warned: set = set()
 
 
@@ -28,7 +28,7 @@ def _env(name: str, default: str = "") -> str:
     if old is not None:
         if name not in _env_warned:
             _env_warned.add(name)
-            log.warning(
+            _env_log.warning(
                 "CHATD_%s is deprecated; use SUBCONSCIOUS_%s",
                 name, name,
             )
@@ -339,23 +339,37 @@ CHAT_TOOL_RESULT_MAX_CHARS: int = int(
 def _load_bg_prompt(name: str) -> str:
     paths = [
         Path(__file__).resolve().parent.parent / "worker" / "prompts" / f"{name}.txt",
-        Path("/etc/subconscious/prompts") / f"{name}.txt",
-        Path(os.path.expanduser("~/.config/subconscious/prompts")) / f"{name}.txt",
+        Path("/etc/chatd/prompts") / f"{name}.txt",
+        Path(os.path.expanduser("~/.config/chatd/prompts")) / f"{name}.txt",
     ]
     for p in paths:
         if p.exists():
             try:
                 text = p.read_text(encoding="utf-8").strip()
                 if text:
-                    log.info("prompt %s loaded from %s (%d chars)", name, p, len(text))
+                    # Import-time load happens before logging.basicConfig
+                    # in the entrypoint, so info would be discarded. Warning
+                    # reaches the root logger's default handler and shows
+                    # in journald at startup, where it belongs: the operator
+                    # needs to know which file is actually in effect.
+                    _env_log.warning(
+                        "prompt %s: loaded from %s (%d chars)",
+                        name, p, len(text),
+                    )
                     return text
-            except Exception:
+            except Exception as e:
+                _env_log.warning(
+                    "prompt %s: failed to read %s: %s", name, p, e,
+                )
                 continue
-    env_val = _env(f"BG_PROMPT_{name.upper()}", "")
+    env_val = _env("BG_PROMPT_{}".format(name.upper()), "")
     if env_val:
-        log.info("prompt %s loaded from env (%d chars)", name, len(env_val))
+        _env_log.warning(
+            "prompt %s: loaded from env BG_PROMPT_%s (%d chars)",
+            name, name.upper(), len(env_val),
+        )
     else:
-        log.info("prompt %s using code default", name)
+        _env_log.warning("prompt %s: using code default", name)
     return env_val
 
 
