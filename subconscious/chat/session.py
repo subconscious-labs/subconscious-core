@@ -29,7 +29,7 @@ _SESSIONS: Dict[str, "Session"] = {}
 @dataclass
 class Session:
     session_id: str
-
+    user_id: Optional[str] = None
     # ── system prompt cache (L0+L1 only; L1.5 is always per-request) ─────────
     # Avoids rebuilding the static wake-up block on every HTTP request.
     # Invalidated when a mempalace write-tool is called.
@@ -78,16 +78,31 @@ class Session:
         except Exception as e:
             log.warning("[session:%s] save failed (path=%s): %s", self.session_id, path, e)
 
-    def append_chatlog(self, user: str, assistant: str) -> None:
-        """Append one turn to the persistent JSONL chatlog - never truncates."""
+    def append_chatlog(
+        self, user: str, assistant: str,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """Append one turn to the persistent JSONL chatlog - never truncates.
+
+        user_id is written on the human entry only: it identifies who the
+        turn came from, and the following assistant entry is the answer.
+        Carrying it on both would duplicate state without adding meaning.
+        """
         log_path = self._jsonl_path()
+        effective_uid = user_id or self.user_id
+        human_entry: Dict[str, Any] = {
+            "type": "human",
+            "message": {"role": "human", "content": user},
+        }
+        if effective_uid:
+            human_entry["user_id"] = effective_uid
         lines = [
-            json.dumps({"type": "human",
-                        "message": {"role": "human", "content": user}},
-                       ensure_ascii=False),
-            json.dumps({"type": "assistant",
-                        "message": {"role": "assistant", "content": assistant}},
-                       ensure_ascii=False),
+            json.dumps(human_entry, ensure_ascii=False),
+            json.dumps(
+                {"type": "assistant",
+                 "message": {"role": "assistant", "content": assistant}},
+                ensure_ascii=False,
+            ),
         ]
         try:
             with log_path.open("a", encoding="utf-8") as f:
@@ -106,11 +121,32 @@ class Session:
         return cls(session_id=session_id)
 
 
-def get_session(session_id: str) -> Session:
-    """Return an in-memory Session, loading from disk on first access."""
+def get_session(session_id: str, user_id: Optional[str] = None) -> Session:
+    """Return an in-memory Session, loading from disk on first access.
+
+    user_id is set on first sighting and never silently overwritten: a
+    later call with a different value indicates a bug (session key was
+    somehow reassigned across users) and is logged as a warning, not
+    applied.
+    """
     if session_id not in _SESSIONS:
-        _SESSIONS[session_id] = Session.load(session_id)
-    return _SESSIONS[session_id]
+        s = Session.load(session_id)
+        s.user_id = user_id
+        _SESSIONS[session_id] = s
+        return s
+
+    existing = _SESSIONS[session_id]
+    if user_id is not None:
+        if existing.user_id is None:
+            existing.user_id = user_id
+            log.debug("[session:%s] user_id set to %s", session_id, user_id)
+        elif existing.user_id != user_id:
+            log.warning(
+                "[session:%s] user_id changed %s -> %s (unexpected for the "
+                "same session key); keeping original",
+                session_id, existing.user_id, user_id,
+            )
+    return existing
 
 
 def invalidate_all_prompt_caches() -> None:
@@ -124,11 +160,15 @@ def invalidate_all_prompt_caches() -> None:
     log.debug("[session] invalidated base prompt cache on %d sessions", len(_SESSIONS))
 
 
-def record_turn(session: Session, user_msg: str, assistant_msg: str) -> None:
+def record_turn(
+    session: Session, user_msg: str, assistant_msg: str,
+    user_id: Optional[str] = None,
+) -> None:
     """Append a Q/A pair to the JSONL chatlog and touch the JSON marker."""
-    session.append_chatlog(user_msg, assistant_msg)
+    session.append_chatlog(user_msg, assistant_msg, user_id=user_id)
     session.save()
     log.debug(
-        "[session:%s] turn recorded (user=%d chars, assistant=%d chars)",
+        "[session:%s] turn recorded (user=%d chars, assistant=%d chars, uid=%s)",
         session.session_id, len(user_msg), len(assistant_msg),
+        user_id or session.user_id or "-",
     )

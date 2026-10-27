@@ -45,8 +45,13 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in cur.fetchall())
+
+
 def init() -> None:
-    """Initialise the L1.5 external RAG store (chatd-owned, separate from mempalace)."""
+    """Initialise the L1.5 external RAG store."""
     if not RAG_ENABLED:
         log.info("RAG: disabled via SUBCONSCIOUS_RAG_ENABLED")
         return
@@ -67,9 +72,32 @@ def init() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_rag_added_at ON rag_chunks(added_at)"
         )
+
+        # Migration: user_id added after initial deployments. SQLite has no
+        # ADD COLUMN IF NOT EXISTS, so probe first. Existing rows stay NULL
+        # and are treated as legacy by retrieve().
+        if not _has_column(conn, "rag_chunks", "user_id"):
+            conn.execute("ALTER TABLE rag_chunks ADD COLUMN user_id TEXT")
+            log.info("RAG: added user_id column (existing rows remain NULL)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rag_user ON rag_chunks(user_id)"
+        )
+
         conn.commit()
         total = conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0]
-        log.info("RAG: store ready at %s (total chunks: %d)", _db_path(), total)
+        nulls = conn.execute(
+            "SELECT COUNT(*) FROM rag_chunks WHERE user_id IS NULL"
+        ).fetchone()[0]
+        log.info(
+            "RAG: store ready at %s (total: %d, no user_id: %d)",
+            _db_path(), total, nulls,
+        )
+        if nulls > 0:
+            log.warning(
+                "RAG: %d legacy chunk(s) without user_id; they remain "
+                "visible to every query until re-indexed",
+                nulls,
+            )
     finally:
         conn.close()
 
@@ -116,7 +144,10 @@ def _count_total() -> int:
         return -1
 
 
-def index_turn(source: str, user: str, assistant: str) -> None:
+def index_turn(
+    source: str, user: str, assistant: str,
+    user_id: Optional[str] = None,
+) -> None:
     """Index one conversation turn into the L1.5 RAG store."""
     if not RAG_ENABLED:
         return
@@ -134,21 +165,22 @@ def index_turn(source: str, user: str, assistant: str) -> None:
     try:
         conn.execute(
             """
-            INSERT INTO rag_chunks(source, chunk, embedding, added_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO rag_chunks(source, chunk, embedding, added_at, user_id)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 source,
                 chunk,
                 json.dumps(embedding),
                 datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                user_id,
             ),
         )
         conn.commit()
         total = conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0]
         log.debug(
-            "RAG: indexed chunk source=%s chunk_len=%d db_total=%d",
-            source, chunk_len, total,
+            "RAG: indexed chunk source=%s chunk_len=%d uid=%s db_total=%d",
+            source, chunk_len, user_id or "-", total,
         )
     except Exception as e:
         log.warning("RAG: failed to index chunk for %s: %s", source, e)
@@ -156,8 +188,17 @@ def index_turn(source: str, user: str, assistant: str) -> None:
         conn.close()
 
 
-def retrieve(query: str, top_k: int = RAG_TOP_K) -> Optional[str]:
-    """Return L1.5 RAG context: top-k semantically similar past turns for *query*."""
+def retrieve(
+    query: str, top_k: int = RAG_TOP_K,
+    user_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return top-k semantically similar past turns for *query*.
+
+    user_id filters to that user's chunks plus legacy chunks with NULL
+    user_id (pre-migration). Without user_id the query is not filtered,
+    preserving pre-migration behaviour for callers that do not know
+    who is asking.
+    """
     if not RAG_ENABLED:
         return None
     query = (query or "").strip()
@@ -172,12 +213,20 @@ def retrieve(query: str, top_k: int = RAG_TOP_K) -> Optional[str]:
 
     conn = _connect()
     try:
-        rows = conn.execute(
-            "SELECT source, chunk, embedding, added_at FROM rag_chunks ORDER BY id DESC LIMIT 200"
-        ).fetchall()
+        if user_id is None:
+            rows = conn.execute(
+                "SELECT source, chunk, embedding, added_at FROM rag_chunks "
+                "ORDER BY id DESC LIMIT 200"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT source, chunk, embedding, added_at FROM rag_chunks "
+                "WHERE user_id = ? OR user_id IS NULL "
+                "ORDER BY id DESC LIMIT 200",
+                (user_id,),
+            ).fetchall()
     except Exception as e:
         log.warning("RAG: retrieval query failed: %s", e)
-        conn.close()
         return None
     finally:
         conn.close()

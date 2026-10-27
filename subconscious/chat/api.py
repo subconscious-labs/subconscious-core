@@ -304,6 +304,7 @@ def _check_event_token() -> Optional[Tuple[Response, int]]:
 def ensure_system_prompt(
     messages: List[Dict[str, Any]],
     session: Optional[sess.Session] = None,
+    user_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Assemble system prompt and inject request-scoped RAG context.
 
@@ -320,6 +321,10 @@ def ensure_system_prompt(
     Returns (messages, layer_sizes) where layer_sizes maps layer name to
     char count: L0+L1, L1.5_kg, L1.5_rag.
     """
+    # Resolve user_id for RAG filtering. Session is the source of truth
+    # (it was set when the session was created); explicit param is a
+    # fallback for stateless paths like process_event on a fresh event.
+    resolved_uid = (session.user_id if session else None) or user_id
     # L0+L1: cached per session
     if session is not None:
         base_prompt = session.get_cached_base_prompt()
@@ -350,7 +355,7 @@ def ensure_system_prompt(
     # L1.5: attach to the last user message.
     original_user = _last_user_text(msgs)
     if original_user:
-        rag_ctx = rag.retrieve(original_user)
+        rag_ctx = rag.retrieve(original_user, user_id=resolved_uid)
         if rag_ctx:
             layer_sizes["L1.5_rag"] = len(rag_ctx)
             log.debug("[sidecar] injecting %d-char RAG recall into last user message",
@@ -1119,6 +1124,7 @@ def chat_stream_generator(
     layer_sizes: Dict[str, int],
     req_id: str = "-",
     clean_user: str = "",
+    user_id: Optional[str] = None,
 ) -> Generator[bytes, None, None]:
     prev_tool_calls: Optional[List[str]] = None
     repeat_count = 0
@@ -1419,11 +1425,15 @@ def chat_stream_generator(
                 req_id, session.session_id,
                 len(last_user_msg), len(final_assistant_content),
             )
-            sess.record_turn(session, last_user_msg, final_assistant_content)
+            sess.record_turn(
+                session, last_user_msg, final_assistant_content,
+                user_id=user_id,
+            )
             rag.index_turn(
                 source=f"session:{session.session_id}",
                 user=last_user_msg,
                 assistant=final_assistant_content,
+                user_id=user_id,
             )
         else:
             log.debug(
@@ -1452,16 +1462,19 @@ def chat():
     want_stream = original_payload.get("stream", True)
 
     chat_id = extract_chat_id(request)
-    session = sess.get_session(chat_id) if chat_id else None
+    user_id = _extract_user_id(request)
+    session = sess.get_session(chat_id, user_id=user_id) if chat_id else None
 
-    log.info("[%s] chat_id=%s", req_id, chat_id)
+    log.info("[%s] chat_id=%s user_id=%s", req_id, chat_id, user_id)
 
     # Capture the ORIGINAL user text before RAG injection. Session log and
     # RAG index must store what the human wrote, not the augmented prompt -
     # otherwise RAG would index its own sidecar and echo it back next turn.
     original_user = _last_user_text(messages)
 
-    messages, layer_sizes = ensure_system_prompt(messages, session=session)
+    messages, layer_sizes = ensure_system_prompt(
+        messages, session=session, user_id=user_id,
+    )
 
     log.info("[%s] POST /api/chat model=%s stream=%s messages=%d options=%s",
              req_id, model, want_stream, len(messages), options)
@@ -1475,11 +1488,12 @@ def chat():
                     "[%s] non-stream: saving turn session=%s user=%d chars answer=%d chars",
                     req_id, session.session_id, len(original_user), len(answer),
                 )
-                sess.record_turn(session, original_user, answer)
+                sess.record_turn(session, original_user, answer, user_id=user_id)
                 rag.index_turn(
                     source=f"session:{session.session_id}",
                     user=original_user,
                     assistant=answer,
+                    user_id=user_id,
                 )
 
             log.info("[%s] non-stream done, answer_len=%d", req_id, len(answer))
@@ -1504,6 +1518,7 @@ def chat():
             chat_stream_generator(
                 model, messages, options, session, layer_sizes, req_id,
                 clean_user=original_user,
+                user_id=user_id,
             )
         ),
         content_type="application/x-ndjson",
@@ -1928,7 +1943,7 @@ def process_event(
     _log_event_journal(req_id, event_type, event_source, payload_dict)
 
     # Load (or create) session, if we have a key.
-    session = sess.get_session(session_key) if session_key else None
+    session = sess.get_session(session_key, user_id=user_id) if session_key else None
 
     history: List[Dict[str, Any]] = []
     if session is not None:
@@ -1952,7 +1967,9 @@ def process_event(
     human_text = _extract_event_human_text(payload_dict)
     original_user = human_text or event_text
 
-    messages, layer_sizes = ensure_system_prompt(messages, session=session)
+    messages, layer_sizes = ensure_system_prompt(
+        messages, session=session, user_id=user_id,
+    )
 
     def _run():
         lock = _get_session_lock(session_key) if session_key else None
@@ -1965,11 +1982,14 @@ def process_event(
             )
             if session is not None and answer:
                 try:
-                    sess.record_turn(session, original_user, answer)
+                    sess.record_turn(
+                        session, original_user, answer, user_id=user_id,
+                    )
                     rag.index_turn(
                         source=f"session:{session.session_id}",
                         user=original_user,
                         assistant=answer,
+                        user_id=user_id,
                     )
                 except Exception as e:
                     log.warning(
@@ -2010,10 +2030,11 @@ def system_event():
         event_payload = {k: v for k, v in ev.items()
                          if k not in ("type", "source", "model", "options")}
 
+    user_id = ev.get("user_id") or _extract_user_id(request)
     req_id = process_event(
         event_type, event_source, event_payload,
         model=ev.get("model"), options=ev.get("options"),
-        user_id=ev.get("user_id"),
+        user_id=user_id,
     )
     return jsonify({"ok": True, "req_id": req_id}), 202
 
