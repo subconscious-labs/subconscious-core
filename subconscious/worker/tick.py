@@ -490,9 +490,9 @@ def _planner() -> Dict[str, Any]:
         limit=BG_RECENT_OBSERVATIONS_LIMIT,
         max_age_hours=BG_OBSERVATION_MAX_AGE_HOURS,
     )
-    obs_lines = []
-    for o in observations:
-        ts = (o.get("updated_at") or o.get("created_at") or "?")[:16]
+    Obs_Lines = []
+    For O In Observations:
+        Ts = (O.Get("Updated_At") or o.get("created_at") or "?")[:16]
         kind = o.get("kind", "?")
         res = (o.get("last_result") or "").replace("\n", " ").strip()
         if len(res) > BG_OBSERVATION_SNIPPET_CHARS:
@@ -879,6 +879,12 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         "done", "partial", "blocked"
     ) else ("done" if outcome == "done" else
             "pending" if outcome == "partial" else "blocked")
+    # "partial" is an executor self-assessment, not a goal status.
+    # Goal statuses are pending | active | blocked | done | cancelled.
+    # Progress without completion must keep the goal open so the next
+    # tick picks it up again, not archive it as done.
+    if new_status == "partial":
+        new_status = "pending"
 
     new_goals_raw = parsed.get("new_goals") or []
     new_goals: List[str] = []
@@ -1231,7 +1237,12 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     g = ledger.find_goal(goals["goals"], picked_goal["id"])
     reflector_needed = False
     if g is not None:
-        if executor_result["outcome"] == "failed":
+        # Executor "blocked" is a failure: route through _apply_failure
+        # so attempts increment and Reflector eventually fires. Going
+        # through _apply_goal_update would mark it blocked with
+        # attempts=0 and no escalation path.
+        if (executor_result["outcome"] == "failed"
+                or executor_result["new_status"] == "blocked"):
             _apply_failure(g, executor_result["observation"])
             if g["status"] == "blocked":
                 reflector_needed = True
@@ -1241,7 +1252,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             _apply_goal_update(
                 g,
                 executor_result["new_status"] if executor_result["new_status"]
-                in ("done", "partial") else "done",
+                in ("done", "pending") else "done",
                 executor_result["observation"],
             )
 

@@ -329,8 +329,8 @@ CHAT_TOOL_RESULT_MAX_CHARS: int = int(
 # Installations can override per-host or per-user without touching code:
 #
 #   1. prompts/<name>.txt                     (bundled default, in repo)
-#   2. /etc/chatd/prompts/<name>.txt          (system override)
-#   3. ~/.config/chatd/prompts/<name>.txt     (user override)
+#   2. /etc/subconscious/prompts/<name>.txt          (system override)
+#   3. ~/.config/subconscious/prompts/<name>.txt     (user override)
 #   4. SUBCONSCIOUS_BG_PROMPT_<NAME> env var  (runtime override)
 #
 # Later sources override earlier ones. Empty result means "use code default",
@@ -339,8 +339,8 @@ CHAT_TOOL_RESULT_MAX_CHARS: int = int(
 def _load_bg_prompt(name: str) -> str:
     paths = [
         Path(__file__).resolve().parent.parent / "worker" / "prompts" / f"{name}.txt",
-        Path("/etc/chatd/prompts") / f"{name}.txt",
-        Path(os.path.expanduser("~/.config/chatd/prompts")) / f"{name}.txt",
+        Path("/etc/subconscious/prompts") / f"{name}.txt",
+        Path(os.path.expanduser("~/.config/subconscious/prompts")) / f"{name}.txt",
     ]
     for p in paths:
         if p.exists():
