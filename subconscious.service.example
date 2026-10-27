@@ -15,7 +15,7 @@ ExecStart=/opt/chatd/venv/bin/gunicorn \
     --timeout 0 \
     --keep-alive 75 \
     --graceful-timeout 60 \
-    chatd:app
+    subconscious.chat.api:app
 Restart=on-failure
 NoNewPrivileges=yes
 PrivateTmp=yes

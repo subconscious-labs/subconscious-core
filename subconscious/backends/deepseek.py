@@ -23,7 +23,7 @@ from typing import Any, Dict, Generator, List
 
 import requests
 
-from config import DEEPSEEK_API
+from subconscious.runtime.config import DEEPSEEK_API
 
 log = logging.getLogger("chatd.backends.deepseek")
 

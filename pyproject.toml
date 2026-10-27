@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subconscious-core"
+version = "2.0.0"
+description = "Autonomous agents that live in your infrastructure"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+dependencies = [
+    "Flask==3.1.3",
+    "fastmcp==3.4.5",
+    "gevent==26.7.0",
+    "gunicorn==26.0.0",
+    "mcp==1.29.0",
+    "requests==2.33.1",
+    "sqlite-vec==0.1.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["subconscious*"]
+
+[tool.setuptools.package-data]
+subconscious = ["worker/prompts/*.txt"]

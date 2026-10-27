@@ -4,6 +4,7 @@ venv/
 *.yaml
 mcp/*
 !mcp/.gitkeep
+*.egg-info/
 
 # local
 .env

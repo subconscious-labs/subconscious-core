@@ -46,7 +46,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from config import (
+from subconscious.runtime.config import (
     BG_MODEL,
     BG_MODEL_EXECUTOR,
     BG_MODEL_PLANNER,
@@ -654,8 +654,8 @@ def _llm_call(
     response_format: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Single backend call. Returns {content, thinking, tool_calls, tokens, raw}."""
-    import backends
-    from config import DEFAULT_OPTIONS, THINKING
+    from subconscious import backends
+    from subconscious.runtime.config import DEFAULT_OPTIONS, THINKING
 
     options = dict(DEFAULT_OPTIONS)
     if num_predict is not None:
@@ -720,7 +720,7 @@ def _system_block(phase: str) -> str:
     Returns "" when the mode is "none", the caller should skip the
     system message entirely.
     """
-    from config import (
+    from subconscious.runtime.config import (
         BG_WAKEUP_MODE,
         BG_WAKEUP_MODE_PLANNER,
         BG_WAKEUP_MODE_EXECUTOR,
@@ -739,10 +739,10 @@ def _system_block(phase: str) -> str:
     if mode == "none":
         return ""
     if mode == "identity":
-        import memory
+        from subconscious.memory import wakeup as memory
         return memory.wake_up_identity_only()
     # "full" or anything unrecognised - fall back to full
-    import memory
+    from subconscious.memory import wakeup as memory
     return memory.wake_up()
 
 
@@ -780,7 +780,7 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
 
 def _allowed_tools_for(kind: str) -> List[Dict[str, Any]]:
     """Return the tools list visible to the Executor for this goal kind."""
-    import chatd  # local import to avoid circular import at module load
+    from subconscious.chat import api as chatd
 
     all_tools = getattr(chatd, "TOOLS", []) or []
     allowed_names = {t for t in BG_TOOLS_ALLOWED if t}
@@ -815,7 +815,7 @@ def _truncate_tool_result(result: Any, limit: Optional[int] = None) -> str:
 
 
 def _execute_tool_call(tc: Dict[str, Any]) -> Any:
-    import chatd
+    from subconscious.chat import api as chatd
 
     name = tc.get("name") or "unknown"
     args = tc.get("arguments") or {}

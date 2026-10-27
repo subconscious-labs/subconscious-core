@@ -22,8 +22,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from config import (
-    MEMPALACE_PALACE_PATH,  # kept for backwards compat / logging
+from subconscious.runtime.config import (
+    MEMPALACE_PALACE_PATH,
     MEMORY_KG_SNIPPET_LIMIT,
     IDENTITY_PATH,
     _env,
@@ -77,7 +77,7 @@ def _read_identity() -> str:
 def _kg_snippet_via_mcp(limit: int = MEMORY_KG_SNIPPET_LIMIT) -> str:
     """Fetch a KG snippet via MCP. Returns "" on any failure."""
     try:
-        import mcp_registry
+        from subconscious.tools import registry as mcp_registry
     except Exception as e:
         log.debug("mcp_registry not available: %s", e)
         return ""

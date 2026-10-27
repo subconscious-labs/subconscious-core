@@ -29,7 +29,10 @@ except ImportError:
     create_mcp_http_client = None
     _HTTP_NEW_API = False
 
-from config import MCP_ENV_PREFIXES
+from subconscious.runtime.config import (
+    MCP_ENV_PREFIXES,
+    _env,
+)
 
 log = logging.getLogger("chatd.mcp_client")
 # The MCP SDK's HTTP client is very noisy when connections drop,
@@ -38,8 +41,6 @@ log = logging.getLogger("chatd.mcp_client")
 logging.getLogger("httpx2").setLevel(logging.WARNING)
 logging.getLogger("httpcore2").setLevel(logging.WARNING)
 logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
-
-from config import _env
 
 MCP_LIST_TOOLS_TIMEOUT: float = float(_env("MCP_LIST_TOOLS_TIMEOUT", "30"))
 MCP_CALL_TOOL_TIMEOUT:  float = float(_env("MCP_CALL_TOOL_TIMEOUT",  "60"))

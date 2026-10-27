@@ -261,7 +261,7 @@ def _compact_goal(g: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _read_archive_all() -> List[Dict[str, Any]]:
-    import background
+    from subconscious.worker import tick as background
     path = background._goals_archive_path()
     if not path.exists():
         return []
@@ -288,7 +288,7 @@ def _acquire_ledger_lock(timeout_sec: float = 5.0):
     reuse TickLock - it already serializes run_tick, and one lock for
     "background state writes" is simpler than two.
     """
-    import background
+    from subconscious.worker import tick as background
     deadline = time.time() + timeout_sec
     lock = background.TickLock(background._lock_path())
     while time.time() < deadline:
@@ -301,7 +301,7 @@ def _acquire_ledger_lock(timeout_sec: float = 5.0):
 # ── implementations ───────────────────────────────────────────────────────────
 
 def _list_goals(args: Dict[str, Any]) -> Dict[str, Any]:
-    import background
+    from subconscious.worker import tick as background
 
     status_filter = (args.get("status") or "open").lower()
     kind_filter   = (args.get("kind") or "all").lower()
@@ -339,7 +339,7 @@ def _list_goals(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _get_goal(args: Dict[str, Any]) -> Dict[str, Any]:
-    import background
+    from subconscious.worker import tick as background
 
     goal_id = (args.get("goal_id") or "").strip()
     if not goal_id:
@@ -359,7 +359,7 @@ def _get_goal(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _create_goal(args: Dict[str, Any]) -> Dict[str, Any]:
-    import background
+    from subconscious.worker import tick as background
 
     title = (args.get("title") or "").strip()
     if not title:
@@ -400,7 +400,7 @@ def _create_goal(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
-    import background
+    from subconscious.worker import tick as background
 
     ids: List[str] = []
     single = (args.get("goal_id") or "").strip()
@@ -461,7 +461,7 @@ def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _journal_tail(args: Dict[str, Any]) -> Dict[str, Any]:
-    import background
+    from subconscious.worker import tick as background
     from collections import deque
 
     n = int(args.get("n") or 20)
@@ -522,7 +522,7 @@ def _journal_tail(args: Dict[str, Any]) -> Dict[str, Any]:
 # ── dispatcher ────────────────────────────────────────────────────────────────
 
 def _find_mcp_client(name: str):
-    import chatd
+    from subconscious.chat import api as chatd
     for client in getattr(chatd, "_MCP_CLIENTS", []):
         if client.name == name:
             return client
@@ -530,7 +530,7 @@ def _find_mcp_client(name: str):
 
 
 def _mcp_server_list(args: Dict[str, Any]) -> Dict[str, Any]:
-    import chatd
+    from subconscious.chat import api as chatd
 
     clients = getattr(chatd, "_MCP_CLIENTS", [])
     servers = []

@@ -20,8 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
-import backends
-from config import (
+from subconscious import backends
+from subconscious.runtime.config import (
     RAG_DB_PATH,
     RAG_EMBED_MODEL,
     RAG_ENABLED,

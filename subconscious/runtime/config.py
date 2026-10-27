@@ -317,7 +317,7 @@ CHAT_TOOL_RESULT_MAX_CHARS: int = int(
 
 def _load_bg_prompt(name: str) -> str:
     paths = [
-        Path(__file__).parent / "prompts" / f"{name}.txt",
+        Path(__file__).resolve().parent.parent / "worker" / "prompts" / f"{name}.txt",
         Path("/etc/chatd/prompts") / f"{name}.txt",
         Path(os.path.expanduser("~/.config/chatd/prompts")) / f"{name}.txt",
     ]

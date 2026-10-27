@@ -13,14 +13,14 @@ from __future__ import annotations
 
 from typing import Dict
 
-from backends.base import Backend
+from subconscious.backends.base import Backend
 
 
 def _make_registry() -> Dict[str, Backend]:
-    from backends.ollama import OllamaBackend
-    from backends.openrouter import OpenRouterBackend
-    from backends.onnx import OnnxBackend
-    from backends.deepseek import DeepSeekBackend
+    from subconscious.backends.ollama import OllamaBackend
+    from subconscious.backends.openrouter import OpenRouterBackend
+    from subconscious.backends.onnx import OnnxBackend
+    from subconscious.backends.deepseek import DeepSeekBackend
 
     return {
         "or/":   OpenRouterBackend(),

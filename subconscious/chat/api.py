@@ -16,13 +16,13 @@ from requests.exceptions import ReadTimeout, RequestException
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 
-import backends
-import background
-import internal_tools
-import memory
-import rag
-import session as sess
-from config import (
+from subconscious import backends
+from subconscious.worker import tick as background
+from subconscious.tools import internal as internal_tools
+from subconscious.memory import wakeup as memory
+from subconscious.memory import rag
+from subconscious.chat import session as sess
+from subconscious.runtime.config import (
     THINKING,
     TOOLS_FILTER,
     TOOLS_ALLOWED,
@@ -40,9 +40,9 @@ from config import (
     BG_TOKEN,
     _env,
 )
-from backends.ollama import OLLAMA_API
-from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
-from mcp_client import MCPClient, discover_mcp_servers
+from subconscious.backends.ollama import OLLAMA_API
+from subconscious.backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
+from subconscious.tools.mcp_client import MCPClient, discover_mcp_servers
 
 
 # ── logging ────────────────────────────────────────────────────────────────────
@@ -817,7 +817,7 @@ def init_tools():
     global TOOLS, TOOL_REGISTRY, _MCP_CLIENTS
     log.info("[tools] initializing MCP tools...")
     TOOLS, TOOL_REGISTRY, _MCP_CLIENTS = load_tools()
-    import mcp_registry
+    from subconscious.tools import registry as mcp_registry
     mcp_registry.reset(TOOLS, TOOL_REGISTRY)
     atexit.register(_stop_all_mcp_clients)
     log.info("[tools] total: %d tools in registry", len(TOOLS))

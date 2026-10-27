@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
-from config import SESSION_DIR
+from subconscious.runtime.config import SESSION_DIR
 
 log = logging.getLogger("chatd.session")
 

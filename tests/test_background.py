@@ -11,9 +11,6 @@ from pathlib import Path
 
 import pytest
 
-# Make background.py importable when running from repo root.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 
 @pytest.fixture()
 def bg(tmp_path, monkeypatch):
@@ -22,7 +19,7 @@ def bg(tmp_path, monkeypatch):
     for mod in list(sys.modules):
         if mod in ("background", "config"):
             del sys.modules[mod]
-    import background  # noqa: WPS433
+    from subconscious.worker import tick as background
     return background
 
 
