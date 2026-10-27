@@ -39,6 +39,7 @@ from subconscious.runtime.config import (
     DEEPSEEK_API,
     DEEPSEEK_API_MODELS,
     BG_ENABLED,
+    BG_TICK_TIMEOUT,
     BG_TOKEN,
     _env,
 )
