@@ -25,6 +25,7 @@ from typing import Optional
 from config import (
     MEMPALACE_PALACE_PATH,  # kept for backwards compat / logging
     MEMORY_KG_SNIPPET_LIMIT,
+    IDENTITY_PATH,
     _env,
 )
 
@@ -35,14 +36,40 @@ LAYER_15_ENABLED: bool = _env("LAYER_15_ENABLED", "true").lower() == "true"
 
 # ── identity ──────────────────────────────────────────────────────────────────
 
+_DEFAULT_IDENTITY = """\
+I am a local autonomous agent.
+
+I have memory (identity, knowledge about the infrastructure, history of dialogues) and tools (MCP servers for diagnostics, communication, and working with memory). I work in interactive mode (dialogue with a person) and in the background (I independently explore the system).
+
+My task is to notice events, investigate, remember findings, and keep the person informed. First, I observe, then I act.
+"""
+
+
 def _read_identity() -> str:
-    """Read identity.txt relative to this file."""
-    identity_path = Path(__file__).parent / "identity.txt"
+    """Read identity.txt from state. Create a minimal default if missing.
+
+    The file is operator content, not repository content: it is never
+    shipped with the code and never overwritten once created. A missing
+    file is seeded with a generic default so the agent has a working
+    sense of self on a fresh install. Read-only filesystems fall back
+    to the in-memory default rather than crashing at startup.
+    """
+    path = Path(os.path.expanduser(IDENTITY_PATH))
     try:
-        return identity_path.read_text(encoding="utf-8").strip()
-    except Exception as e:
-        log.warning("identity.txt read failed: %s", e)
-        return ""
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_DEFAULT_IDENTITY, encoding="utf-8")
+            log.warning(
+                "identity.txt not found, created default at %s - edit it "
+                "to describe this installation", path,
+            )
+        return path.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        log.error(
+            "identity.txt unavailable at %s: %s - using in-memory default",
+            path, e,
+        )
+        return _DEFAULT_IDENTITY.strip()
 
 
 # ── KG snippet via MCP ────────────────────────────────────────────────────────
@@ -123,11 +150,14 @@ def init() -> None:
     """Run startup health checks."""
     log.info("FastMemory: layer flags - L1.5=%s", LAYER_15_ENABLED)
 
+    path = Path(os.path.expanduser(IDENTITY_PATH))
+    log.info("FastMemory: identity path = %s", path)
+
     identity = _read_identity()
     if identity:
-        log.info("FastMemory: identity.txt loaded (%d chars)", len(identity))
+        log.info("FastMemory: identity loaded (%d chars)", len(identity))
     else:
         log.warning(
-            "FastMemory: identity.txt missing or empty - wake-up will be "
-            "KG-only until it is created"
+            "FastMemory: identity is empty - wake-up will be KG-only "
+            "until content is added to %s", path,
         )

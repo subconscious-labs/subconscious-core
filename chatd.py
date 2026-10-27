@@ -30,8 +30,6 @@ from config import (
     MAX_TOOL_ROUNDS,
     MAX_HISTORY_TURNS,
     MEMPALACE_WRITE_TOOLS,
-    TOOL_OVERRIDE,
-    TOOL_DESCRIPTION_OVERRIDES,
     CHAT_TOOL_RESULT_MAX_CHARS,
     EVENT_TOKEN,
     EVENT_MODEL,
@@ -776,9 +774,6 @@ def load_tools():
             if not name or not input_schema:
                 log.warning("[tools] %s: skipping tool without name/schema: %r", server_name, t)
                 continue
-
-            if TOOL_OVERRIDE and name in TOOL_DESCRIPTION_OVERRIDES:
-                description = TOOL_DESCRIPTION_OVERRIDES.get(name, description)
 
             registry[name] = client
 

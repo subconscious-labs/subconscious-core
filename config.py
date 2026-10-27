@@ -5,7 +5,6 @@ All runtime settings are read from environment variables so that the project
 can be installed anywhere without modifying source files.  Copy .env.example
 to .env (or set Environment= in the systemd unit) and adjust as needed.
 """
-import configparser
 import logging
 import os
 from pathlib import Path
@@ -88,11 +87,18 @@ MEMPALACE_WRITE_TOOLS: Set[str] = {
 }
 
 # ── Session ───────────────────────────────────────────────────────────────────
-SESSION_DIR: str = _env("SESSION_DIR", "~/.local/share/chatd/sessions")
+SESSION_DIR: str = _env("SESSION_DIR", "/var/lib/subconscious/sessions")
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+# Operator content, not repository content. Auto-created from a generic
+# default on first start if missing; existing files are never overwritten.
+IDENTITY_PATH: str = _env(
+    "IDENTITY_PATH", "/var/lib/subconscious/identity.txt"
+)
 
 # ── External RAG store ────────────────────────────────────────────────────────
 RAG_ENABLED: bool = _env("RAG_ENABLED", "true").lower() == "true"
-RAG_DB_PATH: str = _env("RAG_DB_PATH", "~/.local/share/chatd/rag.sqlite3")
+RAG_DB_PATH: str = _env("RAG_DB_PATH", "/var/lib/subconscious/rag.sqlite3")
 RAG_EMBED_MODEL: str = _env("RAG_EMBED_MODEL", "nomic-embed-text")
 RAG_TOP_K: int = int(_env("RAG_TOP_K", "4"))
 RAG_MAX_CHARS_PER_CHUNK: int = int(_env("RAG_MAX_CHARS_PER_CHUNK", "4000"))
@@ -120,27 +126,7 @@ EVENT_TOKEN: str = _env("EVENT_TOKEN", "")
 # Model used to process incoming events (can differ from chat model).
 EVENT_MODEL: str = _env("EVENT_MODEL", "")
 
-# ── Tool description overrides ────────────────────────────────────────────────
-TOOL_OVERRIDE: bool = _env("TOOL_OVERRIDE", "false").lower() == "true"
-
-def _load_tool_descriptions() -> Dict[str, str]:
-    cfg = configparser.ConfigParser()
-    bundled = Path(__file__).parent / "tool_descriptions.ini"
-    paths = [
-        str(bundled),
-        "/etc/chatd/tool_descriptions.ini",
-        os.path.expanduser("~/.config/chatd/tool_descriptions.ini"),
-        _env("TOOL_DESCRIPTIONS", ""),
-    ]
-    cfg.read([p for p in paths if p])
-    return {
-        key: val.strip()
-        for section in cfg.sections()
-        for key, val in cfg.items(section)
-    }
-
-
-TOOL_DESCRIPTION_OVERRIDES: Dict[str, str] = _load_tool_descriptions()
+# -- DeepSeek API --------------------------------------------------------------
 
 DEEPSEEK_API: str = _env("DEEPSEEK_API", "https://api.deepseek.com")
 
