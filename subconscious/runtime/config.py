@@ -81,9 +81,23 @@ MEMPALACE_KG_PATH: str = os.environ.get(
     "MEMPALACE_KG_PATH", "~/.mempalace/knowledge_graph.sqlite3"
 )
 
+# Any tool in this set triggers a wake-up rebuild after it succeeds:
+# the KG snippet may have changed, and cached sessions must re-read it.
+# Keep this list up to date when mempalace gains new write tools -
+# forgetting an entry means stale KG in every cached session until restart.
 MEMPALACE_WRITE_TOOLS: Set[str] = {
+    # KG mutations
     "mempalace_kg_add",
+    "mempalace_kg_supersede",
+    "mempalace_kg_invalidate",
+    # Drawer mutations
     "mempalace_add_drawer",
+    "mempalace_delete_drawer",
+    "mempalace_delete_by_source",
+    # Diary (writes into the same palace, reads as drawers)
+    "mempalace_diary_write",
+    # Event/diary housekeeping that changes palace state
+    "mempalace_checkpoint",
 }
 
 # ── Session ───────────────────────────────────────────────────────────────────

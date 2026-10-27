@@ -847,6 +847,39 @@ def init_tools():
     log.info("[tools] total: %d tools in registry", len(TOOLS))
 
 
+def _is_memory_write(name: str, arguments: Dict[str, Any]) -> bool:
+    """Return True if this call mutated the memory palace.
+
+    Two paths must be detected:
+      - direct tool call: name is the write tool itself
+      - meta_call proxy:  the real tool is in arguments["tool_ref"],
+                          formatted as "<server>/<tool>"
+    Without the meta_call branch, any write routed through lazy-mcp
+    (which is every mempalace write on this install) skips the cache
+    invalidation and leaves stale KG in every cached session.
+    """
+    if name in MEMPALACE_WRITE_TOOLS:
+        return True
+    if name == "meta_call":
+        ref = arguments.get("tool_ref")
+        if isinstance(ref, str) and "/" in ref:
+            actual = ref.rsplit("/", 1)[-1]
+            return actual in MEMPALACE_WRITE_TOOLS
+    return False
+
+
+def _tool_call_failed(result: Any) -> bool:
+    """Return True if the tool result signals a failure - invalidate only
+    on success, since a failed write did not change the palace."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("success") is False:
+        return True
+    if "error" in result and not result.get("success"):
+        return True
+    return False
+
+
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     """Invoke a tool by name."""
     if internal_tools.is_internal(name):
@@ -881,7 +914,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             "mcp_result":  result,
         }
 
-    if name in MEMPALACE_WRITE_TOOLS:
+    if _is_memory_write(name, arguments) and not _tool_call_failed(result):
         memory.invalidate()
         sess.invalidate_all_prompt_caches()
 
