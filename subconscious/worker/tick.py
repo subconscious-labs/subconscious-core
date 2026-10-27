@@ -490,9 +490,9 @@ def _planner() -> Dict[str, Any]:
         limit=BG_RECENT_OBSERVATIONS_LIMIT,
         max_age_hours=BG_OBSERVATION_MAX_AGE_HOURS,
     )
-    Obs_Lines = []
-    For O In Observations:
-        Ts = (O.Get("Updated_At") or o.get("created_at") or "?")[:16]
+    obs_Lines = []
+    for o in observations:
+        ts = (o.get("Updated_At") or o.get("created_at") or "?")[:16]
         kind = o.get("kind", "?")
         res = (o.get("last_result") or "").replace("\n", " ").strip()
         if len(res) > BG_OBSERVATION_SNIPPET_CHARS:
