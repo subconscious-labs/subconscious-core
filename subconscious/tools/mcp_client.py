@@ -31,6 +31,7 @@ except ImportError:
 
 from subconscious.runtime.config import (
     MCP_ENV_PREFIXES,
+    MCP_EVENT_ALLOWED,
     _env,
 )
 
@@ -229,7 +230,6 @@ class MCPClient:
                     return
 
                 # Check allowlist
-                from config import MCP_EVENT_ALLOWED
                 if not ("*" in MCP_EVENT_ALLOWED or self.name in MCP_EVENT_ALLOWED):
                     log.warning("[mcp] %s: event rejected (not in MCP_EVENT_ALLOWED)", self.name)
                     return
