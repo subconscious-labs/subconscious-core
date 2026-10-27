@@ -479,3 +479,55 @@ def read_recent_archive(limit: int = 30) -> List[Dict[str, Any]]:
     except Exception:
         pass
     return items
+
+
+def close_orphaned_ticks(max_age_sec: int) -> int:
+    """Append aborted entries for started ticks older than max_age_sec.
+
+    A tick writes `started` first. If the process is SIGKILLed mid-tick
+    (systemd restart, deploy, OOM), no done/timeout/error follows. The
+    journal stays open forever, and journal readers see a tick that
+    never finished. Detect this at startup and close the orphan with an
+    explicit aborted entry so downstream tooling can trust the ledger.
+
+    Returns the number of orphans closed.
+    """
+    path = journal_path()
+    if not path.exists():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+    except Exception as e:
+        log.warning("orphan scan failed to read journal: %s", e)
+        return 0
+
+    # Per req_id: last status wins.
+    last_status: Dict[str, Dict] = {}
+    for e in entries:
+        rid = e.get("req_id")
+        if rid:
+            last_status[rid] = e
+
+    now = datetime.now(timezone.utc)
+    orphans = 0
+    for rid, e in last_status.items():
+        if e.get("status") != "started":
+            continue
+        try:
+            ts = datetime.strptime(
+                e["ts"][:19], "%Y-%m-%dT%H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if (now - ts).total_seconds() <= max_age_sec:
+            continue
+        append_journal({
+            "req_id": rid,
+            "ts": now_iso(),
+            "status": "aborted",
+            "reason": "process terminated mid-tick",
+            "started_at": e["ts"],
+        })
+        orphans += 1
+    return orphans

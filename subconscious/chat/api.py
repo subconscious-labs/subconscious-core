@@ -2092,6 +2092,11 @@ memory.init()
 rag.init()
 events_store.init()
 
+from subconscious.worker import ledger
+orphans = ledger.close_orphaned_ticks(BG_TICK_TIMEOUT)
+if orphans:
+    log.warning("closed %d orphaned tick entries", orphans)
+
 if __name__ == "__main__":
     log.info("started")
     app.run(host="0.0.0.0", port=5001, debug=False)
