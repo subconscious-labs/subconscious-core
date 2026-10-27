@@ -133,6 +133,14 @@ hours describes a past state that may no longer hold. Do not create new
 goals based on stale observations: if the newest signal is old, prefer
 "skip" or pick an existing goal that already has fresh context. If you
 cannot point to a fresh observation, return "skip".
+
+Goals are shown with both attempts (hard failures) and partials
+(progress without completion). A goal with partials >= 2 has already
+been tried twice and failed for the same blocking reason. Prefer "skip"
+over "pick" for such goals unless a FRESH observation specifically
+provides what the previous partial was missing (a tool that is now
+available, a value that was not there before, a different path that
+just opened up). "It might work this time" is not a reason to pick.
 """
 
 _DEFAULT_EXECUTOR_INSTRUCTIONS = """\
@@ -516,7 +524,7 @@ def _planner() -> Dict[str, Any]:
     for g in open_list:
         listing_lines.append(
             f"- id={g['id']} kind={g['kind']} attempts={g['attempts']} "
-            f"title={g['title']!r}"
+            f"partials={g.get('partials', 0)} title={g['title']!r}"
         )
     listing = "\n".join(listing_lines) if listing_lines else "(none)"
 
@@ -989,6 +997,36 @@ def _apply_failure(g: Dict[str, Any], observation: str) -> None:
     )
 
 
+def _apply_partial(g: Dict[str, Any], observation: str) -> None:
+    """Progress without completion. Keeps the goal pending but tracks
+    how many partials it has accumulated, so the planner can see that
+    repeated partials with the same blocker mean "not actionable
+    without new information".
+
+    Escalation to blocked after BG_MAX_PARTIALS_PER_GOAL: further
+    picks are wasted tokens, and Reflector should decide whether to
+    cancel or retry with a different angle.
+    """
+    from subconscious.runtime.config import (
+        BG_MAX_ATTEMPTS_PER_GOAL,  # reuse same cap semantics
+    )
+    g["partials"] = int(g.get("partials", 0)) + 1
+    now = now_iso()
+    g["updated_at"] = now
+    if observation:
+        g["last_result"] = observation
+    if g["partials"] >= BG_MAX_ATTEMPTS_PER_GOAL:
+        g["status"] = "blocked"
+        event = "blocked_after_partials"
+    else:
+        g["status"] = "pending"
+        event = "partial"
+    g.setdefault("history", []).append(
+        {"ts": now, "event": event, "by": "executor",
+         "partials": g["partials"]}
+    )
+
+
 # ── run_tick ──────────────────────────────────────────────────────────────────
 
 def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
@@ -1237,24 +1275,21 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     g = ledger.find_goal(goals["goals"], picked_goal["id"])
     reflector_needed = False
     if g is not None:
-        # Executor "blocked" is a failure: route through _apply_failure
-        # so attempts increment and Reflector eventually fires. Going
-        # through _apply_goal_update would mark it blocked with
-        # attempts=0 and no escalation path.
-        if (executor_result["outcome"] == "failed"
-                or executor_result["new_status"] == "blocked"):
+        outcome = executor_result["outcome"]
+        new_status = executor_result["new_status"]
+
+        if outcome == "failed" or new_status == "blocked":
             _apply_failure(g, executor_result["observation"])
+            if g["status"] == "blocked":
+                reflector_needed = True
+        elif outcome == "partial":
+            ledger.apply_partial(g, executor_result["observation"])
             if g["status"] == "blocked":
                 reflector_needed = True
         else:
             if picked_goal["kind"] == "exploratory" and executor_result.get("title"):
                 g["title"] = executor_result["title"]
-            _apply_goal_update(
-                g,
-                executor_result["new_status"] if executor_result["new_status"]
-                in ("done", "pending") else "done",
-                executor_result["observation"],
-            )
+            _apply_goal_update(g, "done", executor_result["observation"])
 
         open_count = len(ledger.open_goals(goals["goals"]))
         added = 0
