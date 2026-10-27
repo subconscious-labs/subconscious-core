@@ -156,7 +156,15 @@ Rules:
 - "done"    - goal fully completed.
 - "partial" - some progress, goal should stay open.
 - "failed"  - could not make progress; attempts will be incremented.
-- new_goals: only if you discovered something worth following up. May be [].
+- new_goals: only if the tool results revealed a NEW concrete issue worth
+  investigating in its own right. May be [].
+
+  Do NOT create a new_goal because you were unable to complete the
+  current goal and need more information. Missing information is a
+  "partial" outcome: describe what you found and what is missing in
+  "observation", leave new_goals empty. The goal stays pending; if the
+  same block repeats BG_MAX_ATTEMPTS times, Reflector will cancel it.
+  Do not chain goals to try to unblock other goals.
 """
 
 _DEFAULT_EXPLORATORY_INSTRUCTIONS = """\
