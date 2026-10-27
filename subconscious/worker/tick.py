@@ -281,7 +281,7 @@ def _llm_call(
         + int(usage.get("completion_tokens") or 0)
     )
     if tokens > 0:
-        ledger.budget_add_llm(tokens, _is_cloud(model))
+        ledger.budget_add_llm(tokens, ledger.is_cloud(model))
     return {
         "content":    msg.get("content") or "",
         "thinking":   thinking,
@@ -358,6 +358,39 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
         return json.loads(candidate)
     except Exception:
         return None
+
+
+
+def _observation_or_fallback(
+    parsed: Dict[str, Any],
+    resp: Dict[str, Any],
+    model: str,
+    context: str = "",
+) -> str:
+    """Return observation text, or a diagnostic if the model produced none.
+
+    When the executor's final JSON parse fails - typically after a cloud
+    budget degrade to a smaller local model that cannot follow the
+    schema - observation would otherwise be empty. Fall back to a raw
+    response preview or a structured diagnostic so the ledger always
+    carries actionable signal.
+    """
+    obs = str(parsed.get("observation") or "").strip()
+    if obs:
+        return obs
+    raw_preview = (resp.get("content") or "")[:200].strip() if resp else ""
+    if raw_preview:
+        prefix = f"{context} " if context else ""
+        return (
+            f"{prefix}produced no JSON summary; "
+            f"raw response preview: {raw_preview!r}"
+        )
+    label = context or "executor"
+    finish = resp.get("done_reason", "?") if resp else "?"
+    return (
+        f"{label} returned empty content "
+        f"(finish_reason={finish}, model={model})"
+    )
 
 
 # ── tools filtering for executor ──────────────────────────────────────────────
@@ -488,8 +521,8 @@ def _planner() -> Dict[str, Any]:
     log.info("[bg planner] thinking(%d)=%r", len(_r), _r[:400])
 
     if not _c.strip():
-        _append_journal({
-            "ts": _now_iso(),
+        ledger.append_journal({
+            "ts": ledger.now_iso(),
             "phase": "planner",
             "diagnostic": "empty_content",
             "content_len": 0,
@@ -660,7 +693,7 @@ def _executor_tool_loop(
 
 def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
     model = BG_MODEL_EXECUTOR or BG_MODEL
-    model, degrade_reason = _resolve_model(model, "executor")
+    model, degrade_reason = ledger.resolve_model(model, "executor")
     kind = goal.get("kind", "normal")
     tools = _allowed_tools_for(kind)
 
@@ -708,6 +741,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
             },
         ]
         tokens_total = 0
+        resp: Dict[str, Any] = {}
         try:
             resp = _llm_call(messages, model, tools=None,
                              num_predict=BG_NUM_PREDICT)
@@ -724,24 +758,9 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(useful, bool):
             useful = None
 
-        observation = str(parsed.get("observation") or "").strip()
-
-        if not observation:
-        # JSON parse failed or observation field missing. Give the ledger
-        # something actionable instead of an empty string that Reflector
-        # cannot reason about.
-        raw_preview = (resp.get("content") or "")[:200].strip()
-        if raw_preview:
-            observation = (
-                f"executor produced no JSON summary; raw response preview: "
-                f"{raw_preview!r}"
-            )
-        else:
-            observation = (
-                f"executor returned empty content (finish_reason="
-                f"{resp.get('done_reason', '?')}, model={model})"
-            )
-
+        observation = _observation_or_fallback(
+            parsed, resp, model, "exploratory"
+        )
         new_goals = []
         raw = parsed.get("new_goals") or []
         if isinstance(raw, list):
@@ -800,6 +819,8 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
             "need in the observation field - do not call tools."
         ),
     })
+    resp: Dict[str, Any] = {}
+    resp: Dict[str, Any] = {}
     try:
         # Keep tools in the payload to preserve the DeepSeek prefix cache.
         # The tool schema block is part of the cache key; stripping it here
@@ -829,23 +850,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         "done", "partial", "failed"
     ) else "failed"
 
-    observation = str(parsed.get("observation") or "").strip()
-    if not observation:
-        # JSON parse failed or observation field missing. Give the ledger
-        # something actionable instead of an empty string that Reflector
-        # cannot reason about.
-        raw_preview = (resp.get("content") or "")[:200].strip()
-        if raw_preview:
-            observation = (
-                f"executor produced no JSON summary; raw response preview: "
-                f"{raw_preview!r}"
-            )
-        else:
-            observation = (
-                f"executor returned empty content (finish_reason="
-                f"{resp.get('done_reason', '?')}, model={model})"
-            )
-
+    observation = _observation_or_fallback(parsed, resp, model)
     upd = parsed.get("goal_updates") or {}
     new_status = upd.get("status") if upd.get("status") in (
         "done", "partial", "blocked"
@@ -877,7 +882,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
 
 def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
     model = BG_MODEL_REFLECTOR or BG_MODEL
-    model, degrade_reason = _resolve_model(model, "reflector")
+    model, degrade_reason = ledger.resolve_model(model, "reflector")
     history_lines = []
     for h in (goal.get("history") or [])[-10:]:
         history_lines.append(
@@ -940,7 +945,7 @@ def _apply_goal_update(g: Dict[str, Any], status: str, last_result: Optional[str
 
 def _apply_failure(g: Dict[str, Any], observation: str) -> None:
     g["attempts"] = int(g.get("attempts", 0)) + 1
-    now = _now_iso()
+    now = ledger.now_iso()
     g["updated_at"] = now
     if observation:
         g["last_result"] = observation
@@ -963,7 +968,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
 
     ledger.append_journal({
         "req_id": req_id,
-        "ts": _now_iso(),
+        "ts": ledger.now_iso(),
         "session": BG_SESSION_ID,
         "payload": payload,
         "status": "started",
@@ -999,7 +1004,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         ledger.write_goals(goals)
         ledger.append_journal({
             "req_id": req_id,
-            "ts": _now_iso(),
+            "ts": ledger.now_iso(),
             "phase": "planner",
             "model": "(auto-resume)",
             "decision": {"decision": "pick", "goal_id": picked_goal["id"],
@@ -1128,7 +1133,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         if not ledger.exploratory_min_interval_ok(combined):
             log.info("[bg %s] exploratory min interval not elapsed "
                      "(%d min required)",
-                     req_id, BG_EXPLORATORY_MIN_INTERVAL_MIN)
+                     req_id, ledger.BG_EXPLORATORY_MIN_INTERVAL_MIN)
             return {
                 "req_id": req_id,
                 "status": "skipped",
@@ -1163,7 +1168,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             _apply_failure(g, "executor timeout")
             ledger.write_goals(goals)
         ledger.append_journal({
-            "req_id": req_id, "ts": _now_iso(),
+            "req_id": req_id, "ts": ledger.now_iso(),
             "phase": "executor", "status": "timeout", "error": str(e),
         })
         raise
@@ -1199,7 +1204,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     })
 
     # Persist executor result
-    goals = _read_goals()
+    goals = ledger.read_goals()
     g = ledger.find_goal(goals["goals"], picked_goal["id"])
     reflector_needed = False
     if g is not None:
@@ -1224,7 +1229,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 log.info("[bg %s] dropping extra new_goals (cap reached)",
                          req_id)
                 break
-            goals["goals"].append(_new_goal(title, kind="normal"))
+            goals["goals"].append(ledger.new_goal(title, kind="normal"))
             added += 1
 
         ledger.write_goals(goals)
@@ -1254,7 +1259,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             goals = ledger.read_goals()
             g = ledger.find_goal(goals["goals"], picked_goal["id"])
             if g is not None:
-                now = _now_iso()
+                now = ledger.now_iso()
                 if refl["decision"] == "retry":
                     g["attempts"] = 0
                     g["status"] = "pending"
@@ -1297,7 +1302,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
 
 def run_tick(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     """One tick. Returns a JSON-serialisable result dict."""
-    lock = ledger.TickLock(_lock_path())
+    lock = ledger.TickLock(ledger.lock_path())
     if not lock.acquire():
         log.info("[bg %s] tick skipped - previous tick still running", req_id)
         ledger.append_journal({
