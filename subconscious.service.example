@@ -5,9 +5,9 @@ After=network.target
 [Service]
 Type=simple
 User=chatd
-WorkingDirectory=/opt/chatd
-EnvironmentFile=/etc/default/chatd
-ExecStart=/opt/chatd/venv/bin/gunicorn \
+WorkingDirectory=/opt/subconscious
+EnvironmentFile=/etc/subconscious/env
+ExecStart=/opt/subconscious/venv/bin/gunicorn \
     --bind 0.0.0.0:5001 \
     --worker-class gthread \
     --workers 1 \

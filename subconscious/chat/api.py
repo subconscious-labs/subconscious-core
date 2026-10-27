@@ -258,12 +258,18 @@ def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
 
 
 def extract_chat_id(flask_request) -> Optional[str]:
-    """Extract chat session ID from the Referer header.
+    """Extract the chat/session id from headers or Referer.
 
-    Hollama sends requests from /sessions/<id> - the browser automatically
-    includes this URL as the Referer header, so we parse it from there.
-    Falls back to scanning messages for a legacy chatId field.
+    Priority:
+      1. X-OpenWebUI-Chat-Id   - Open WebUI forwards this when
+                                  ENABLE_FORWARD_USER_INFO_HEADERS=true.
+      2. /sessions/<id> in Referer - Hollama's convention.
+      3. Legacy chatId field in messages[] - oldest fallback.
     """
+    owi_chat = flask_request.headers.get("X-OpenWebUI-Chat-Id")
+    if owi_chat and owi_chat.strip():
+        return owi_chat.strip()
+
     referer = flask_request.headers.get("Referer", "")
     if referer:
         m = re.search(r"/sessions/([^/?#]+)", referer)

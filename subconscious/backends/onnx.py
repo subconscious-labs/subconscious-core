@@ -37,9 +37,9 @@ import logging
 import os
 from typing import Any, Dict, Generator, List
 
-from config import _env
+from subconscious.runtime.config import _env
 
-log = logging.getLogger("chatd.backends.onnx")
+log = logging.getLogger("subconscious.backends.onnx")
 
 ONNX_MODEL_DIR: str = _env("ONNX_MODEL_DIR", "")
 ONNX_TOKENIZER_DIR: str = _env("ONNX_TOKENIZER_DIR", ONNX_MODEL_DIR)
