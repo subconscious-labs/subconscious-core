@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
-_env_log = logging.getLogger("chatd.config")
+log = logging.getLogger("subconscious.runtime.config")
 _env_warned: set = set()
 
 
@@ -28,7 +28,7 @@ def _env(name: str, default: str = "") -> str:
     if old is not None:
         if name not in _env_warned:
             _env_warned.add(name)
-            _env_log.warning(
+            log.warning(
                 "CHATD_%s is deprecated; use SUBCONSCIOUS_%s",
                 name, name,
             )
