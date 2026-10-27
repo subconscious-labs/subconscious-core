@@ -23,6 +23,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from subconscious.events import store as events_store
 from subconscious.runtime.config import BG_MAX_OPEN_GOALS
 from subconscious.tools import registry
 from subconscious.worker import ledger
@@ -167,6 +168,83 @@ _SCHEMAS: List[Dict[str, Any]] = [
         },
     },
         {
+        "type": "function",
+        "function": {
+            "name": "event_get",
+            "description": (
+                "Fetch a single event by id, including its payload, "
+                "status, and linked goal. Use when the user refers to a "
+                "specific event id, or when following up on an event "
+                "mentioned in another tool's output."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {
+                        "type": "string",
+                        "description": "Event id, e.g. 'ev-a1b2c3d4e5f6'.",
+                    },
+                },
+                "required": ["event_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "event_list",
+            "description": (
+                "List recent events from the ledger, optionally filtered "
+                "by user, status, or goal. Use to see what has arrived "
+                "recently, what is still pending, or what belongs to a "
+                "specific investigation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "Filter by user identity (email).",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "pending", "processing", "processed",
+                            "linked", "skipped",
+                        ],
+                    },
+                    "goal_id": {
+                        "type": "string",
+                        "description": "Filter by linked goal.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max events. Default 20, max 200.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "event_link",
+            "description": (
+                "Attach an event to a goal. Idempotent - linking an "
+                "already-linked event updates the goal_id. Use when a "
+                "new event is a continuation of an existing investigation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string"},
+                    "goal_id":  {"type": "string"},
+                },
+                "required": ["event_id", "goal_id"],
+            },
+        },
+    },
+    {
         "type": "function",
         "function": {
             "name": "mcp_server_list",
@@ -378,11 +456,11 @@ def _create_goal(args: Dict[str, Any]) -> Dict[str, Any]:
     try:
         goals = ledger.read_goals()
         open_count = len(ledger.open_goals(goals.get("goals", [])))
-        if open_count >= ledger.BG_MAX_OPEN_GOALS:
+        if open_count >= BG_MAX_OPEN_GOALS:
             return {
                 "error": (
                     f"open-goal cap reached "
-                    f"({open_count}/{ledger.BG_MAX_OPEN_GOALS})"
+                    f"({open_count}/{BG_MAX_OPEN_GOALS})"
                 )
             }
         new_g = ledger.new_goal(title, kind="normal")
@@ -417,7 +495,7 @@ def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "background tick is running; try again in a minute"}
     try:
         goals = ledger.read_goals()
-        now = ledger.iso()
+        now = ledger.now_iso()
         cancelled: List[Dict[str, Any]] = []
         not_found: List[str] = []
         already_closed: List[Dict[str, str]] = []
@@ -628,12 +706,48 @@ def _mcp_server_reload(args: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _event_get(args: Dict[str, Any]) -> Dict[str, Any]:
+    event_id = (args.get("event_id") or "").strip()
+    if not event_id:
+        return {"error": "event_id is required"}
+    ev = events_store.get(event_id)
+    if ev is None:
+        return {"error": f"event not found: {event_id}"}
+    return ev
+
+
+def _event_list(args: Dict[str, Any]) -> Dict[str, Any]:
+    limit = int(args.get("limit") or 20)
+    limit = max(1, min(limit, 200))
+    events = events_store.list_events(
+        user_id=(args.get("user_id") or None),
+        status=(args.get("status") or None),
+        goal_id=(args.get("goal_id") or None),
+        limit=limit,
+    )
+    return {"count": len(events), "events": events}
+
+
+def _event_link(args: Dict[str, Any]) -> Dict[str, Any]:
+    event_id = (args.get("event_id") or "").strip()
+    goal_id = (args.get("goal_id") or "").strip()
+    if not event_id or not goal_id:
+        return {"error": "event_id and goal_id are required"}
+    ok = events_store.link(event_id, goal_id)
+    if not ok:
+        return {"error": f"event not found: {event_id}"}
+    return {"linked": True, "event_id": event_id, "goal_id": goal_id}
+
+
 _DISPATCH = {
     "subcortex_goals_list":   _list_goals,
     "subcortex_goals_get":    _get_goal,
     "subcortex_goals_create": _create_goal,
     "subcortex_goals_cancel": _cancel_goal,
     "subcortex_journal_tail": _journal_tail,
+    "event_get":              _event_get,
+    "event_list":             _event_list,
+    "event_link":             _event_link,
     "mcp_server_list":        _mcp_server_list,
     "mcp_server_restart":     _mcp_server_restart,
     "mcp_server_reload":      _mcp_server_reload,

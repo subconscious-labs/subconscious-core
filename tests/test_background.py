@@ -54,6 +54,17 @@ def test_open_goals_count(lgr):
     assert len(lgr.open_goals(goals)) == 2
 
 
+def test_create_goal_via_internal(lgr, tmp_path):
+    from subconscious.tools import internal
+    result = internal.call_internal(
+        "subcortex_goals_create",
+        {"title": "test goal"},
+    )
+    assert "created" in result
+    assert result["created"]["title"] == "test goal"
+
+
+
 def test_find_goal(lgr):
     g = lgr.new_goal("x", kind="normal")
     goals = [g]

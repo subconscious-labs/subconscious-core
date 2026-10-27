@@ -17,11 +17,12 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 
 from subconscious import backends
-from subconscious.worker import tick as background
-from subconscious.tools import internal as internal_tools
+from subconscious.chat import session as sess
+from subconscious.backends.ollama import OLLAMA_API
+from subconscious.backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
+from subconscious.events import store as events_store
 from subconscious.memory import wakeup as memory
 from subconscious.memory import rag
-from subconscious.chat import session as sess
 from subconscious.runtime.config import (
     THINKING,
     TOOLS_FILTER,
@@ -33,6 +34,7 @@ from subconscious.runtime.config import (
     CHAT_TOOL_RESULT_MAX_CHARS,
     EVENT_TOKEN,
     EVENT_MODEL,
+    USER_DEFAULT_ID,
     OPENROUTER_API_MODELS,
     DEEPSEEK_API,
     DEEPSEEK_API_MODELS,
@@ -40,9 +42,9 @@ from subconscious.runtime.config import (
     BG_TOKEN,
     _env,
 )
-from subconscious.backends.ollama import OLLAMA_API
-from subconscious.backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
+from subconscious.tools import internal as internal_tools
 from subconscious.tools.mcp_client import MCPClient, discover_mcp_servers
+from subconscious.worker import tick as background
 
 
 # ── logging ────────────────────────────────────────────────────────────────────
@@ -747,6 +749,7 @@ def load_tools():
             event_payload=payload,
             model=params.get("model"),
             options=params.get("options"),
+            user_id=payload.get("user_id") if isinstance(payload, dict) else None,
         )
 
     for server_name, cfg in discover_mcp_servers().items():
@@ -818,7 +821,7 @@ def init_tools():
     log.info("[tools] initializing MCP tools...")
     TOOLS, TOOL_REGISTRY, _MCP_CLIENTS = load_tools()
     from subconscious.tools import registry as mcp_registry
-    mcp_registry.reset(TOOLS, TOOL_REGISTRY)
+    mcp_registry.reset(TOOLS, TOOL_REGISTRY, _MCP_CLIENTS)
     atexit.register(_stop_all_mcp_clients)
     log.info("[tools] total: %d tools in registry", len(TOOLS))
 
@@ -1693,6 +1696,42 @@ def _extract_session_key(
     return f"xmpp:dm:{bare}"
 
 
+def _extract_user_id(flask_request) -> Optional[str]:
+    """Extract the user identity from request headers.
+
+    Open WebUI, when ENABLE_FORWARD_USER_INFO_HEADERS=true, sends:
+      X-OpenWebUI-User-Email, X-OpenWebUI-User-Id, X-OpenWebUI-User-Name.
+    Email is preferred because it matches the XMPP JID form (person@domain)
+    and makes cross-channel identity possible without a mapping table.
+    Falls back to USER_DEFAULT_ID for single-user installs.
+    """
+    email = flask_request.headers.get("X-OpenWebUI-User-Email")
+    if email and email.strip():
+        return email.strip().lower()
+    uid = flask_request.headers.get("X-OpenWebUI-User-Id")
+    if uid and uid.strip():
+        return uid.strip().lower()
+    if USER_DEFAULT_ID:
+        return USER_DEFAULT_ID.strip().lower()
+    return None
+
+
+def _priority_for_event(event_source: str, payload: Dict[str, Any]) -> int:
+    """Classify event priority from source and payload.
+
+    Critical alerts bypass the queue and are picked first. Interactive
+    channels (webui, xmpp, email) go next. Alerts and monitors are
+    normal. Everything else (ticks, housekeeping) is background.
+    """
+    if payload.get("severity") == "critical":
+        return events_store.PRIORITY_CRITICAL
+    if event_source in ("webui", "xmpp", "email"):
+        return events_store.PRIORITY_INTERACTIVE
+    if event_source == "alert" or event_source.startswith("monitor"):
+        return events_store.PRIORITY_NORMAL
+    return events_store.PRIORITY_BACKGROUND
+
+
 def _extract_event_human_text(payload: Dict[str, Any]) -> str:
     """Pull the human-readable portion of an event payload.
 
@@ -1830,6 +1869,7 @@ def process_event(
     model: Optional[str] = None,
     options: Optional[Dict[str, Any]] = None,
     req_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Common event dispatch logic used by /api/event and MCP notifications.
 
@@ -1868,6 +1908,21 @@ def process_event(
         "[%s] system event: type=%s source=%s model=%s session=%s",
         req_id, event_type, event_source, model,
         session_key or "(stateless)",
+    )
+
+    event_id = events_store.append(
+        source=event_source,
+        event_type=event_type,
+        payload=payload_dict,
+        user_id=user_id,
+        priority=_priority_for_event(event_source, payload_dict),
+        correlation_id=payload_dict.get("correlation_id"),
+    )
+    log.info(
+        "[%s] event recorded: id=%s priority=%d user_id=%s",
+        req_id, event_id,
+        _priority_for_event(event_source, payload_dict),
+        user_id or "-",
     )
 
     _log_event_journal(req_id, event_type, event_source, payload_dict)
@@ -1924,6 +1979,7 @@ def process_event(
             _log_event_journal(
                 req_id, event_type, event_source, payload_dict, answer,
             )
+            events_store.mark(event_id, status="processed")
             log.info("[%s] event worker done, answer_len=%d", req_id, len(answer))
         except Exception:
             log.error("[%s] event worker error:\n%s", req_id, traceback.format_exc())
@@ -1956,7 +2012,8 @@ def system_event():
 
     req_id = process_event(
         event_type, event_source, event_payload,
-        model=ev.get("model"), options=ev.get("options")
+        model=ev.get("model"), options=ev.get("options"),
+        user_id=ev.get("user_id"),
     )
     return jsonify({"ok": True, "req_id": req_id}), 202
 
@@ -2005,6 +2062,7 @@ def bg_tick():
 init_tools()
 memory.init()
 rag.init()
+events_store.init()
 
 if __name__ == "__main__":
     log.info("started")

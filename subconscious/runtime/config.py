@@ -126,6 +126,19 @@ EVENT_TOKEN: str = _env("EVENT_TOKEN", "")
 # Model used to process incoming events (can differ from chat model).
 EVENT_MODEL: str = _env("EVENT_MODEL", "")
 
+# ── Event ledger ──────────────────────────────────────────────────────────────
+# SQLite store for queryable event history. Distinct from the append-only
+# events.jsonl audit trail (kept for tail -f and postmortems).
+EVENTS_DB_PATH: str = _env(
+    "EVENTS_DB_PATH", "/var/lib/subconscious/events.sqlite3"
+)
+
+# Default user id when no X-OpenWebUI-User-Email header is present.
+# Empty means "no user context" - events still get recorded, just without
+# a user_id. Set this on single-user installs to enable cross-channel
+# identity for non-WebUI sources.
+USER_DEFAULT_ID: str = _env("USER_DEFAULT_ID", "")
+
 # -- DeepSeek API --------------------------------------------------------------
 
 DEEPSEEK_API: str = _env("DEEPSEEK_API", "https://api.deepseek.com")
