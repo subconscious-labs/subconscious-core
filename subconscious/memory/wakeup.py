@@ -75,22 +75,32 @@ def _read_identity() -> str:
 # ── KG snippet via MCP ────────────────────────────────────────────────────────
 
 def _kg_snippet_via_mcp(limit: int = MEMORY_KG_SNIPPET_LIMIT) -> str:
-    """Fetch a KG snippet via MCP. Returns "" on any failure."""
     try:
-        from subconscious.tools import registry as mcp_registry
+        from subconscious.tools import registry
     except Exception as e:
-        log.debug("mcp_registry not available: %s", e)
+        log.debug("registry not available: %s", e)
         return ""
 
-    if not mcp_registry.has_tool("mempalace_kg_timeline"):
-        log.debug("mempalace_kg_timeline not registered, KG snippet empty")
-        return ""
+    result = None
 
-    try:
-        result = mcp_registry.call_tool("mempalace_kg_timeline", {})
-    except Exception as e:
-        log.warning("mempalace_kg_timeline call failed: %s", e)
-        return ""
+    # Direct tool if mempalace is its own MCP server.
+    if registry.has_tool("mempalace_kg_timeline"):
+        try:
+            result = registry.call_tool("mempalace_kg_timeline", {})
+        except Exception as e:
+            log.warning("mempalace_kg_timeline direct call failed: %s", e)
+
+    # Fallback: mempalace behind lazy-mcp, tool reachable via meta_call.
+    if result is None and registry.has_tool("meta_call"):
+        try:
+            wrapped = registry.call_tool("meta_call", {
+                "tool_ref": "mempalace/mempalace_kg_timeline",
+                "arguments": {},
+            })
+            if isinstance(wrapped, dict):
+                result = wrapped.get("result") or wrapped
+        except Exception as e:
+            log.warning("mempalace_kg_timeline via meta_call failed: %s", e)
 
     if not isinstance(result, dict):
         return ""
