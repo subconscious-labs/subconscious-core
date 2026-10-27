@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from subconscious.runtime.config import BG_MAX_OPEN_GOALS
+from subconscious.tools import registry
 from subconscious.worker import ledger
 
 
@@ -515,17 +516,14 @@ def _journal_tail(args: Dict[str, Any]) -> Dict[str, Any]:
 # ── dispatcher ────────────────────────────────────────────────────────────────
 
 def _find_mcp_client(name: str):
-    from subconscious.chat import api as chatd
-    for client in getattr(chatd, "_MCP_CLIENTS", []):
+    for client in registry.list_clients():
         if client.name == name:
             return client
     return None
 
 
 def _mcp_server_list(args: Dict[str, Any]) -> Dict[str, Any]:
-    from subconscious.chat import api as chatd
-
-    clients = getattr(chatd, "_MCP_CLIENTS", [])
+    clients = registry.list_clients()
     servers = []
     for c in clients:
         entry: Dict[str, Any] = {

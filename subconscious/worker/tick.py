@@ -74,6 +74,8 @@ from subconscious.runtime.config import (
     BG_PROMPT_EXPLORATORY,
     BG_PROMPT_REFLECTOR,
 )
+from subconscious.tools import registry
+from subconscious.tools import internal as internal_tools
 from subconscious.worker import ledger
 
 log = logging.getLogger("subconscious.worker.tick")
@@ -362,9 +364,7 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
 
 def _allowed_tools_for(kind: str) -> List[Dict[str, Any]]:
     """Return the tools list visible to the Executor for this goal kind."""
-    from subconscious.chat import api as chatd
-
-    all_tools = getattr(chatd, "TOOLS", []) or []
+    all_tools = registry.list_tools()
     allowed_names = {t for t in BG_TOOLS_ALLOWED if t}
 
     selected: List[Dict[str, Any]] = []
@@ -397,8 +397,6 @@ def _truncate_tool_result(result: Any, limit: Optional[int] = None) -> str:
 
 
 def _execute_tool_call(tc: Dict[str, Any]) -> Any:
-    from subconscious.chat import api as chatd
-
     name = tc.get("name") or "unknown"
     args = tc.get("arguments") or {}
     if isinstance(args, str):
@@ -407,15 +405,22 @@ def _execute_tool_call(tc: Dict[str, Any]) -> Any:
         except json.JSONDecodeError:
             args = {}
 
-    # Defense in depth: the tool schema list already excludes internal tools
-    # (not in BG_TOOLS_ALLOWED), but if the model hallucinates one, reject.
+    # Defense in depth: the tool schema list already excludes internal
+    # tools (not in BG_TOOLS_ALLOWED), but if the model hallucinates one,
+    # reject.
     if name not in BG_TOOLS_ALLOWED:
         log.warning("[bg tool] rejected unknown tool: %r args=%r", name, args)
         return {"error": f"tool not allowed in background: {name}"}
 
+    # Background is read-only with respect to the ledger: internal tools
+    # mutate it and are excluded from BG_TOOLS_ALLOWED. Guard anyway.
+    if internal_tools.is_internal(name):
+        log.warning("[bg tool] rejected internal tool: %r", name)
+        return {"error": f"internal tool not allowed in background: {name}"}
+
     try:
-        return chatd.call_tool(name, args)
-    except Exception as e:  # noqa: BLE001
+        return registry.call_tool(name, args)
+    except Exception as e:
         return {"error": str(e), "tool": name}
 
 
