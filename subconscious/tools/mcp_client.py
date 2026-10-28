@@ -459,9 +459,23 @@ class MCPClient:
 
         log.info("[mcp] %s: reconnect loop terminated", self.name)
 
-    def start(self) -> None:
+    def start(self, wait_timeout: float = 30.0) -> bool:
+        """Start the connection loop.
+
+        Returns True if the initial connection succeeded within
+        wait_timeout, False otherwise. In both cases the connection loop
+        runs in the background and keeps retrying with progressive
+        backoff until stop() is called.
+
+        Does NOT raise on initial timeout - the caller decides whether
+        a not-yet-connected client is acceptable. Raising and stopping
+        the loop (previous behaviour) meant that a backend slower than
+        the timeout could never be used for the rest of the process's
+        lifetime; the loop was killed and only a full restart of the
+        whole agent brought it back.
+        """
         if self._thread and self._thread.is_alive():
-            return
+            return self._connection_ready.is_set()
 
         self._loop = asyncio.new_event_loop()
         self._shutdown_event.clear()
@@ -473,11 +487,14 @@ class MCPClient:
         )
         self._thread.start()
 
-        # Wait up to 30s for the initial connection to succeed
-        if not self._connection_ready.wait(timeout=30):
-            log.error("[mcp] %s: initial connection timed out", self.name)
-            self.stop()
-            raise RuntimeError(f"MCP server {self.name} initial connection timed out")
+        ready = self._connection_ready.wait(timeout=wait_timeout)
+        if not ready:
+            log.warning(
+                "[mcp] %s: not connected after %.0fs, "
+                "reconnect loop continues in background",
+                self.name, wait_timeout,
+            )
+        return ready
 
     def stop(self) -> None:
         self._shutdown_event.set()
@@ -529,8 +546,15 @@ class MCPClient:
             log.error("[mcp] %s: signal(%d) permission denied: %s", self.name, sig, e)
             return False
 
-    def restart(self, force: bool = False) -> bool:
-        """Stop and start again. force=True means SIGKILL immediately."""
+    def restart(
+        self, force: bool = False, wait_timeout: float = 30.0,
+    ) -> bool:
+        """Stop and start again. force=True means SIGKILL immediately.
+
+        Returns True if the fresh connection is up within wait_timeout.
+        Returns False if the connection is not ready yet - the
+        reconnect loop continues in the background either way.
+        """
         log.info("[mcp] %s: restarting (force=%s)", self.name, force)
         if force and self.transport == "stdio" and self._pid:
             log.warning("[mcp] %s: force-restart (SIGKILL pid %d)", self.name, self._pid)
@@ -540,12 +564,7 @@ class MCPClient:
                 pass
 
         self.stop()
-        try:
-            self.start()
-            return True
-        except Exception as e:
-            log.error("[mcp] %s: restart failed: %s", self.name, e)
-            return False
+        return self.start(wait_timeout=wait_timeout)
 
     def reload(self, wait: float = 2.0) -> Dict[str, Any]:
         """Try SIGHUP; fall back to restart if the server dies or stops working."""

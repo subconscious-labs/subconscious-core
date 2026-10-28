@@ -86,13 +86,19 @@ def load_tools():
 
     for server_name, cfg in discover_mcp_servers().items():
         client = MCPClient(cfg, name=server_name, on_event=_mcp_event_cb)
-        try:
-            client.start()
-        except Exception as e:
-            log.error("[tools] %s: failed to start MCP server: %s", server_name, e)
-            continue
-
+        ready = client.start()
+        # Always register the client: atexit needs it for cleanup,
+        # mcp_server_restart needs it to find the client when the
+        # backend comes up later.
         clients.append(client)
+
+        if not ready:
+            log.warning(
+                "[tools] %s: connecting in background, tools unavailable "
+                "until mcp_server_restart after the backend is up",
+                server_name,
+            )
+            continue
 
         try:
             server_tools = client.list_tools()

@@ -63,3 +63,39 @@ def call_tool(tool_name: str, arguments: Dict[str, Any]) -> Any:
 
 def has_tool(tool_name: str) -> bool:
     return tool_name in REGISTRY
+
+
+def refresh_server(
+    name: str,
+    tools: List[Dict],
+    registry_entries: Dict[str, Any],
+) -> None:
+    """Replace all tool schemas and registry entries for one MCP server.
+
+    Used by mcp_server_restart: after a client reconnects (e.g., lazy-mcp
+    was down at subconscious startup and came up later), this makes its
+    tools visible without restarting the whole process.
+
+    Reassignment (TOOLS = TOOLS + new) is intentional: any thread that
+    is currently iterating list_tools() keeps its old snapshot, and the
+    next call sees the new list. REGISTRY mutation is single-key, each
+    operation atomic under the GIL. No one iterates REGISTRY, so
+    concurrent mutation is safe.
+    """
+    global TOOLS, REGISTRY
+
+    old_names = {
+        tn for tn, c in REGISTRY.items()
+        if c is not None and getattr(c, "name", None) == name
+    }
+    if old_names:
+        TOOLS = [
+            t for t in TOOLS
+            if (t.get("function") or {}).get("name") not in old_names
+        ]
+        for tn in old_names:
+            REGISTRY.pop(tn, None)
+
+    TOOLS = TOOLS + list(tools)
+    for tn, c in registry_entries.items():
+        REGISTRY[tn] = c

@@ -24,7 +24,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from subconscious.events import store as events_store
-from subconscious.runtime.config import BG_MAX_OPEN_GOALS
+from subconscious.runtime.config import (
+    BG_MAX_OPEN_GOALS,
+    TOOLS_ALLOWED,
+    TOOLS_FILTER,
+)
 from subconscious.tools import registry
 from subconscious.worker import ledger
 
@@ -787,18 +791,63 @@ def _mcp_server_restart(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"MCP server not found: {name}"}
 
     ok = client.restart(force=force)
-    if ok:
+    if not ok:
+        return {
+            "status": "restart_initiated",
+            "name": name,
+            "force": force,
+            "note": (
+                "Reconnect loop is running in the background. Retry "
+                "mcp_server_restart after the backend is up; tools will "
+                "register on the next successful restart."
+            ),
+        }
+
+    # Refresh tool schemas for this server so they become visible
+    # without restarting subconscious.
+    try:
+        server_tools = client.list_tools()
+    except Exception as e:
         return {
             "status": "restarted",
             "name": name,
             "force": force,
             "pid": getattr(client, "_pid", None),
-            "note": (
-                "Tool schemas are not auto-refreshed. If the server's tool "
-                "set changed, restart chatd to rebuild the registry."
-            ),
+            "warning": f"restart ok but list_tools failed: {e}",
         }
-    return {"error": f"restart failed for {name}"}
+
+    new_tools: List[Dict[str, Any]] = []
+    new_registry: Dict[str, Any] = {}
+    for t in server_tools:
+        tn = getattr(t, "name", None)
+        schema = (
+            getattr(t, "inputSchema", None)
+            or getattr(t, "input_schema", None)
+        )
+        desc = getattr(t, "description", "") or ""
+        if not tn or not schema:
+            continue
+        if TOOLS_FILTER and tn not in TOOLS_ALLOWED:
+            continue
+        new_tools.append({
+            "type": "function",
+            "function": {
+                "name": tn,
+                "description": desc,
+                "parameters": schema,
+            },
+        })
+        new_registry[tn] = client
+
+    registry.refresh_server(name, new_tools, new_registry)
+    return {
+        "status": "restarted",
+        "name": name,
+        "force": force,
+        "pid": getattr(client, "_pid", None),
+        "tools_count": len(new_tools),
+        "tools": [t["function"]["name"] for t in new_tools],
+    }
 
 
 def _mcp_server_reload(args: Dict[str, Any]) -> Dict[str, Any]:
