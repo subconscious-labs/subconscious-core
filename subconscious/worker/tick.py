@@ -54,6 +54,7 @@ from subconscious.runtime.config import (
     BG_MODEL_ASSESSOR,
     BG_MODEL_THINK,  # noqa: F401 - declared for PR D
     BG_MAX_ATTEMPTS_PER_GOAL,
+    BG_MAX_REGRESSED_PER_GOAL,
     BG_MAX_OPEN_GOALS,
     BG_MAX_TOOL_ROUNDS,
     BG_TOOL_RESULT_MAX_CHARS,
@@ -1098,6 +1099,68 @@ def _record_assess_verdict(
     })
 
 
+def _apply_assess_verdict(
+    g: Dict[str, Any], result: Dict[str, Any]
+) -> None:
+    """Apply the assessor verdict to the goal's state (D3).
+
+    _record_assess_verdict has already set assessed/assess_verdict/
+    assessed_at and appended an `assessed=<verdict>` history entry.
+    This function transitions the status according to that verdict:
+
+      verified  -> no change; status stays "done" and write_goals
+                   archives the goal as usual.
+      regressed -> status back to "pending", attempts and partials
+                   reset, regressed_count incremented. Goal re-enters
+                   the open pool and the executor retries on the next
+                   tick. After BG_MAX_REGRESSED_PER_GOAL regressions
+                   the goal moves to "needs-review" instead - further
+                   automatic retries would reproduce the same failure,
+                   and only the operator can decide.
+      unclear   -> status "needs-review". The claim is plausible but
+                   unverifiable from this prompt (live state, remote
+                   host, external action); operator resolves.
+    """
+    now = ledger.now_iso()
+    verdict = result["verdict"]
+
+    if verdict == "verified":
+        return
+
+    if verdict == "regressed":
+        g["regressed_count"] = int(g.get("regressed_count", 0)) + 1
+        if g["regressed_count"] >= BG_MAX_REGRESSED_PER_GOAL:
+            g["status"] = "needs-review"
+            event = "needs-review"
+            note = (
+                f"regressed {g['regressed_count']} times "
+                f"(limit {BG_MAX_REGRESSED_PER_GOAL}), "
+                f"needs operator review"
+            )
+        else:
+            g["status"] = "pending"
+            g["attempts"] = 0
+            g["partials"] = 0
+            event = "regressed_pending"
+            note = (
+                f"regressed, back to pending "
+                f"({g['regressed_count']}/{BG_MAX_REGRESSED_PER_GOAL})"
+            )
+        g["updated_at"] = now
+        g.setdefault("history", []).append({
+            "ts": now, "event": event, "by": "assessor", "note": note,
+        })
+        return
+
+    # verdict == "unclear"
+    g["status"] = "needs-review"
+    g["updated_at"] = now
+    g.setdefault("history", []).append({
+        "ts": now, "event": "needs-review", "by": "assessor",
+        "note": (result.get("reason") or "")[:300],
+    })
+
+
 # ── ledger update helpers ─────────────────────────────────────────────────────
 
 def _apply_goal_update(g: Dict[str, Any], status: str, last_result: Optional[str]) -> None:
@@ -1464,6 +1527,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                         }
 
                     _record_assess_verdict(g, assess_result)
+                    _apply_assess_verdict(g, assess_result)
                     tokens_used += int(assess_result.get("tokens", 0) or 0)
                     ledger.append_journal({
                         "req_id": req_id,

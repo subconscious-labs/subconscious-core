@@ -254,6 +254,14 @@ BG_TICK_TIMEOUT: int = int(_env("BG_TICK_TIMEOUT", "3600"))
 
 # Goal ledger limits.
 BG_MAX_ATTEMPTS_PER_GOAL: int = int(_env("BG_MAX_ATTEMPTS_PER_GOAL", "3"))
+# After this many regressed assessments on the same goal, stop
+# retrying automatically and move it to needs-review. The executor has
+# claimed "done" N times, the assessor has said N times it was not, and
+# another attempt is unlikely to change the outcome. The operator
+# decides: verified, cancelled, or retry with counters reset.
+BG_MAX_REGRESSED_PER_GOAL: int = int(
+    _env("BG_MAX_REGRESSED_PER_GOAL", "2")
+)
 # Maximum number of goals in status pending or active. blocked/done/cancelled
 # do not count. Once reached, Planner cannot create new goals and Executor
 # drops any new_goals from its output.

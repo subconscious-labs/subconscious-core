@@ -515,6 +515,44 @@ def read_recent_normal_goals(limit: int = 5) -> List[Dict[str, Any]]:
     return items[:limit]
 
 
+def read_recent_regressed(limit: int = 5) -> List[Dict[str, Any]]:
+    """Return recent goals whose assessor verdict was "regressed".
+
+    Reads both the active ledger and the archive: a goal that was
+    regressed but never re-attempted (because no tick ran) still sits
+    in goals.json, while a goal that regressed, was verified on a
+    second attempt, and then archived also carries the earlier
+    assess_verdict in the archived entry.
+
+    Used by the planner to keep recent falsely-done goals in context:
+    the model should not propose the same investigation that already
+    failed assessment within the last few ticks.
+    """
+    items: List[Dict[str, Any]] = []
+
+    archive_path = goals_archive_path()
+    if archive_path.exists():
+        try:
+            with archive_path.open("r", encoding="utf-8") as f:
+                lines = f.readlines()[-(limit * 4):]
+            for line in lines:
+                try:
+                    g = json.loads(line)
+                except Exception:
+                    continue
+                if g.get("assess_verdict") == "regressed":
+                    items.append(g)
+        except Exception:
+            pass
+
+    for g in read_goals().get("goals", []):
+        if g.get("assess_verdict") == "regressed":
+            items.append(g)
+
+    items.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    return items[:limit]
+
+
 def read_recent_archive(limit: int = 30) -> List[Dict[str, Any]]:
     """Last `limit` entries from goals.archive.jsonl.
 

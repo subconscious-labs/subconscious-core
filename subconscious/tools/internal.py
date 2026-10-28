@@ -53,8 +53,13 @@ _SCHEMAS: List[Dict[str, Any]] = [
                     "status": {
                         "type": "string",
                         "enum": ["open", "pending", "active", "blocked",
-                                 "done", "cancelled", "all"],
-                        "description": "'open' = pending+active (default).",
+                                 "needs-review", "done", "cancelled",
+                                 "all"],
+                        "description": (
+                            "'open' = pending+active (default). "
+                            "'needs-review' = awaiting operator via "
+                            "subcortex_goals_resolve."
+                        ),
                     },
                     "kind": {
                         "type": "string",
@@ -154,6 +159,38 @@ _SCHEMAS: List[Dict[str, Any]] = [
                         ),
                     },
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "subcortex_goals_resolve",
+            "description": (
+                "Resolve a goal in needs-review status. The assessor "
+                "moved it there because the executor's 'done' claim "
+                "was ambiguous (unclear) or repeatedly false "
+                "(regressed at the limit). Actions: 'verified' - "
+                "accept as done; 'cancelled' - give up; 'retry' - "
+                "return to pending with counters reset for another "
+                "attempt. Only affects goals with status='needs-review'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["verified", "cancelled", "retry"],
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Why resolved. Goes into the goal's history."
+                        ),
+                    },
+                },
+                "required": ["goal_id", "action"],
             },
         },
     },
@@ -348,11 +385,13 @@ def _compact_goal(g: Dict[str, Any]) -> Dict[str, Any]:
         "status":          g.get("status"),
         "attempts":        g.get("attempts", 0),
         "partials":        g.get("partials", 0),
+        "regressed_count": g.get("regressed_count", 0),
         "title":           g.get("title"),
         "created_at":      g.get("created_at"),
         "updated_at":      g.get("updated_at"),
         "last_result":     lr,
         "parent_goal_id":  g.get("parent_goal_id"),
+        "assess_verdict":  g.get("assess_verdict"),
     }
 
 
@@ -568,6 +607,56 @@ def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
         lock.release()
 
 
+def _resolve_goal(args: Dict[str, Any]) -> Dict[str, Any]:
+    goal_id = (args.get("goal_id") or "").strip()
+    action = (args.get("action") or "").strip()
+    if not goal_id or not action:
+        return {"error": "goal_id and action are required"}
+    if action not in ("verified", "cancelled", "retry"):
+        return {"error": f"invalid action: {action}"}
+
+    reason = (args.get("reason") or "").strip()
+
+    lock = _acquire_ledger_lock()
+    if lock is None:
+        return {"error": "background tick is running; try again in a minute"}
+    try:
+        goals = ledger.read_goals()
+        target = ledger.find_goal(goals.get("goals", []), goal_id)
+        if target is None:
+            return {"error": f"goal not found: {goal_id}"}
+        if target.get("status") != "needs-review":
+            return {
+                "error": (
+                    f"goal {goal_id} has status "
+                    f"{target.get('status')!r}, not 'needs-review'"
+                )
+            }
+
+        now = ledger.now_iso()
+        if action == "verified":
+            target["status"] = "done"
+        elif action == "cancelled":
+            target["status"] = "cancelled"
+        else:  # retry
+            target["status"] = "pending"
+            target["attempts"] = 0
+            target["partials"] = 0
+            target["regressed_count"] = 0
+
+        target["updated_at"] = now
+        target.setdefault("history", []).append({
+            "ts": now,
+            "event": f"resolved={action}",
+            "by": "user",
+            "note": reason or "(no reason given)",
+        })
+        ledger.write_goals(goals)
+        return {"resolved": True, "id": goal_id, "action": action}
+    finally:
+        lock.release()
+
+
 def _journal_tail(args: Dict[str, Any]) -> Dict[str, Any]:
     from collections import deque
 
@@ -775,17 +864,18 @@ def _event_link(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _DISPATCH = {
-    "subcortex_goals_list":   _list_goals,
-    "subcortex_goals_get":    _get_goal,
-    "subcortex_goals_create": _create_goal,
-    "subcortex_goals_cancel": _cancel_goal,
-    "subcortex_journal_tail": _journal_tail,
-    "event_get":              _event_get,
-    "event_list":             _event_list,
-    "event_link":             _event_link,
-    "mcp_server_list":        _mcp_server_list,
-    "mcp_server_restart":     _mcp_server_restart,
-    "mcp_server_reload":      _mcp_server_reload,
+    "subcortex_goals_list":    _list_goals,
+    "subcortex_goals_get":     _get_goal,
+    "subcortex_goals_create":  _create_goal,
+    "subcortex_goals_cancel":  _cancel_goal,
+    "subcortex_goals_resolve": _resolve_goal,
+    "subcortex_journal_tail":  _journal_tail,
+    "event_get":               _event_get,
+    "event_list":              _event_list,
+    "event_link":              _event_link,
+    "mcp_server_list":         _mcp_server_list,
+    "mcp_server_restart":      _mcp_server_restart,
+    "mcp_server_reload":       _mcp_server_reload,
 }
 
 
