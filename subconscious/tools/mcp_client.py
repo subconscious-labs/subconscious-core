@@ -32,6 +32,8 @@ except ImportError:
 from subconscious.runtime.config import (
     MCP_ENV_PREFIXES,
     MCP_EVENT_ALLOWED,
+    MCP_HTTP_HEARTBEAT_SEC,
+    MCP_RECONNECT_WAIT_SEC,
     _env,
 )
 
@@ -325,13 +327,38 @@ class MCPClient:
 
                 # HTTP transports have native keep-alive and error handling
                 # via the MCP SDK. Our JSON-RPC ping interferes with it.
+                # Instead we POST a cheap list_tools call periodically:
+                # lazy-mcp (and any streamable-http MCP server with an
+                # idle reaper) treats a quiet client as dead after
+                # session_ttl, and the next real POST gets 404. The
+                # heartbeat keeps LastSeen fresh regardless of the
+                # server's TTL.
                 watchdog_task = None
                 if self.transport == "stdio":
                     watchdog_task = asyncio.create_task(self._watchdog())
 
                 try:
-                    while not self._disconnect_event.is_set() and not self._shutdown_event.is_set():
+                    last_heartbeat = time.time()
+                    while (
+                        not self._disconnect_event.is_set()
+                        and not self._shutdown_event.is_set()
+                    ):
                         await asyncio.sleep(0.5)
+                        if self.transport == "http" and MCP_HTTP_HEARTBEAT_SEC > 0:
+                            now = time.time()
+                            if now - last_heartbeat >= MCP_HTTP_HEARTBEAT_SEC:
+                                try:
+                                    await self._session.list_tools()
+                                    last_heartbeat = now
+                                    log.debug(
+                                        "[mcp] %s: heartbeat ok", self.name,
+                                    )
+                                except Exception as e:
+                                    log.warning(
+                                        "[mcp] %s: heartbeat failed: %s",
+                                        self.name, e,
+                                    )
+                                    self._disconnect_event.set()
                 finally:
                     if watchdog_task:
                         watchdog_task.cancel()
@@ -349,6 +376,7 @@ class MCPClient:
         finally:
             self._session = None
             self._stack = None
+            self._connection_ready.clear()
             log.info("[mcp] %s: disconnected", self.name)
 
     def _connection_loop(self):
@@ -519,6 +547,21 @@ class MCPClient:
         finally:
             self._op_lock.release()
 
+    def _wait_for_reconnect(self, timeout: float = 10.0) -> bool:
+        """Wait until the connection loop has re-established a session.
+
+        Returns True if a live session is available before timeout;
+        False otherwise. Clears _disconnect_event on success so the
+        next call does not immediately try to reconnect again.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._session is not None and self._connection_ready.is_set():
+                self._disconnect_event.clear()
+                return True
+            time.sleep(0.2)
+        return False
+
     def _call_tool_inner(self, name: str, arguments: dict[str, Any]) -> Any:
         try:
             result = self._run(
@@ -526,11 +569,40 @@ class MCPClient:
                 MCP_CALL_TOOL_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            log.error("[mcp] call_tool '%s' timed out after %.0fs: %s", name, MCP_CALL_TOOL_TIMEOUT, self.name)
+            log.error(
+                "[mcp] call_tool '%s' timed out after %.0fs: %s",
+                name, MCP_CALL_TOOL_TIMEOUT, self.name,
+            )
             if self.transport == "stdio":
                 _kill_process(self.cmd)
             self._disconnect_event.set()
-            raise RuntimeError(f"MCP call_tool timeout ({MCP_CALL_TOOL_TIMEOUT:.0f}s): {name}")
+            raise RuntimeError(
+                f"MCP call_tool timeout ({MCP_CALL_TOOL_TIMEOUT:.0f}s): {name}"
+            )
+        except Exception as exc:
+            # If the underlying connection dropped (session expired,
+            # network, proxy restart), _run already set _disconnect_event.
+            # Wait for reconnect and retry once. If the second attempt
+            # also fails, propagate - by then it is not a stale session
+            # but a real problem.
+            if not self._disconnect_event.is_set():
+                raise
+            log.info(
+                "[mcp] %s: call_tool %r failed (%s), waiting for reconnect",
+                self.name, name, exc,
+            )
+            if not self._wait_for_reconnect(timeout=MCP_RECONNECT_WAIT_SEC):
+                log.warning(
+                    "[mcp] %s: reconnect did not complete within %.0fs",
+                    self.name, MCP_RECONNECT_WAIT_SEC,
+                )
+                raise
+            log.info("[mcp] %s: retrying call_tool %r after reconnect",
+                     self.name, name)
+            result = self._run(
+                self._session.call_tool(name, arguments=arguments),
+                MCP_CALL_TOOL_TIMEOUT,
+            )
 
         contents = getattr(result, "content", None) or []
         if not contents:

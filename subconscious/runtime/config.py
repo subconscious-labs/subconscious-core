@@ -54,6 +54,26 @@ MCP_EVENT_ALLOWED: Set[str] = set(
     s.strip() for s in _env("MCP_EVENT_ALLOWED", "").split(",") if s.strip()
 )
 
+# ── MCP idle handling ────────────────────────────────────────────────────────
+# HTTP MCP servers (lazy-mcp in particular) reap idle sessions: a client
+# that does not POST and does not send SSE keepalives for session_ttl
+# is disconnected, and the next POST returns 404. Two mitigations, both
+# applied unconditionally to the http transport:
+#
+#   1. A heartbeat POST (list_tools) every MCP_HTTP_HEARTBEAT_SEC.
+#      Cheap, refreshes LastSeen, keeps the session alive regardless of
+#      whatever TTL the proxy uses. 0 disables.
+#   2. A one-shot retry after reconnect when a call_tool POST still
+#      fails because the session expired between heartbeats.
+#
+# stdio transport is unaffected (own process, no reaper).
+MCP_HTTP_HEARTBEAT_SEC: int = int(
+    _env("MCP_HTTP_HEARTBEAT_SEC", "300")
+)
+MCP_RECONNECT_WAIT_SEC: float = float(
+    _env("MCP_RECONNECT_WAIT_SEC", "10")
+)
+
 # ── Tool rounds ───────────────────────────────────────────────────────────────
 MAX_TOOL_ROUNDS: int = int(_env("MAX_TOOL_ROUNDS", "5"))
 
