@@ -27,6 +27,7 @@ from subconscious.runtime.config import (
     MEMPALACE_PALACE_PATH,
     MEMORY_KG_SNIPPET_LIMIT,
     IDENTITY_PATH,
+    KG_SNIPPET_TIMEOUT,
     _env,
 )
 
