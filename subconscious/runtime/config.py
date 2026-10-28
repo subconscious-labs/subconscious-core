@@ -74,6 +74,18 @@ MCP_RECONNECT_WAIT_SEC: float = float(
     _env("MCP_RECONNECT_WAIT_SEC", "10")
 )
 
+# Retry backoff for MCP reconnects. First attempt waits 1s, then
+# doubles to the cap. For a service that can be down for minutes, 300s
+# between attempts is a reasonable steady state: aggressive enough to
+# recover quickly when the backend returns, quiet enough not to spam
+# journald during a planned outage.
+MCP_RECONNECT_INITIAL_BACKOFF_SEC: float = float(
+    _env("MCP_RECONNECT_INITIAL_BACKOFF_SEC", "1")
+)
+MCP_RECONNECT_MAX_BACKOFF_SEC: float = float(
+    _env("MCP_RECONNECT_MAX_BACKOFF_SEC", "300")
+)
+
 # ── Tool rounds ───────────────────────────────────────────────────────────────
 MAX_TOOL_ROUNDS: int = int(_env("MAX_TOOL_ROUNDS", "5"))
 

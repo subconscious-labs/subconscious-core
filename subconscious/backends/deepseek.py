@@ -25,7 +25,7 @@ import requests
 
 from subconscious.runtime.config import DEEPSEEK_API
 
-log = logging.getLogger("chatd.backends.deepseek")
+log = logging.getLogger("subconscious.backends.deepseek")
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 

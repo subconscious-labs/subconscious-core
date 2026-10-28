@@ -31,7 +31,7 @@ from subconscious.runtime.config import (
     _env,
 )
 
-log = logging.getLogger("chatd.memory")
+log = logging.getLogger("subconscious.memory.wakeup")
 
 LAYER_15_ENABLED: bool = _env("LAYER_15_ENABLED", "true").lower() == "true"
 

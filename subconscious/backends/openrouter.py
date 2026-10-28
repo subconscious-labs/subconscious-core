@@ -33,7 +33,7 @@ OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_API_BASE: str = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
 OPENROUTER_PREFIX: str = os.environ.get("OPENROUTER_PREFIX", "or/")
 
-log = logging.getLogger("chatd.backends.openrouter")
+log = logging.getLogger("subconscious.backends.openrouter")
 
 _PREFIX: str = OPENROUTER_PREFIX
 

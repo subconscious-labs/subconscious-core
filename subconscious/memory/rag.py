@@ -30,7 +30,7 @@ from subconscious.runtime.config import (
     RAG_TOP_K,
 )
 
-log = logging.getLogger("chatd.rag")
+log = logging.getLogger("subconscious.memory.rag")
 
 
 def _db_path() -> Path:

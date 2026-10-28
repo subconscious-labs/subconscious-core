@@ -23,7 +23,7 @@ import requests
 
 OLLAMA_API: str = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434")
 
-log = logging.getLogger("chatd.backends.ollama")
+log = logging.getLogger("subconscious.backends.ollama")
 
 _session: requests.Session = requests.Session()
 

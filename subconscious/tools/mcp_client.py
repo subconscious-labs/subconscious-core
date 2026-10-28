@@ -34,10 +34,13 @@ from subconscious.runtime.config import (
     MCP_EVENT_ALLOWED,
     MCP_HTTP_HEARTBEAT_SEC,
     MCP_RECONNECT_WAIT_SEC,
+    MCP_RECONNECT_MAX_BACKOFF_SEC,
+    MCP_RECONNECT_INITIAL_BACKOFF_SEC,
     _env,
 )
 
-log = logging.getLogger("chatd.mcp_client")
+log = logging.getLogger("subconscious.tools.mcp_client")
+
 # The MCP SDK's HTTP client is very noisy when connections drop,
 # logging full tracebacks for network errors that we already handle
 # via reconnects.
@@ -380,28 +383,81 @@ class MCPClient:
             log.info("[mcp] %s: disconnected", self.name)
 
     def _connection_loop(self):
-        asyncio.set_event_loop(self._loop)
-        backoff = 1.0
+        """Independent reconnect loop.
+
+        Each attempt gets a fresh event loop and a fresh AsyncExitStack
+        inside _run_session. The MCP SDK's streamable_http_client uses a
+        TaskGroup internally; when the initial connect fails, the
+        TaskGroup cancellation can leave the shared loop in a state
+        where a subsequent run_until_complete on the same loop does not
+        start (silent stall after two attempts, observed 2026-10-28). A
+        fresh loop per attempt is cheap and removes the entire class of
+        interference.
+
+        Backoff grows from MCP_RECONNECT_INITIAL_BACKOFF_SEC by doubling
+        up to MCP_RECONNECT_MAX_BACKOFF_SEC. Loop runs until
+        _shutdown_event is set; every iteration logs the attempt number,
+        wait, and outcome so a stuck retry is visible in journald.
+        """
+        backoff = MCP_RECONNECT_INITIAL_BACKOFF_SEC
+        attempt = 0
 
         while not self._shutdown_event.is_set():
+            attempt += 1
+
+            # Fresh loop per attempt: see docstring.
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+
+            error_class = None
             try:
-                self._loop.run_until_complete(self._run_session())
+                loop.run_until_complete(self._run_session())
             except asyncio.CancelledError:
-                # Loop is shutting down or task was cancelled
                 if not self._shutdown_event.is_set():
-                    log.debug("[mcp] %s: task cancelled unexpectedly", self.name)
+                    log.debug(
+                        "[mcp] %s: attempt #%d cancelled",
+                        self.name, attempt,
+                    )
             except Exception as e:
+                error_class = type(e).__name__
                 if not self._shutdown_event.is_set():
-                    log.warning("[mcp] %s: connection error: %s", self.name, e)
+                    log.warning(
+                        "[mcp] %s: attempt #%d failed (%s): %s",
+                        self.name, attempt, error_class, e,
+                    )
+            finally:
+                try:
+                    loop.close()
+                except Exception as e:
+                    log.debug(
+                        "[mcp] %s: loop close failed after #%d: %s",
+                        self.name, attempt, e,
+                    )
 
             if self._shutdown_event.is_set():
+                log.info(
+                    "[mcp] %s: reconnect loop exiting (shutdown)",
+                    self.name,
+                )
                 break
 
-            log.info("[mcp] %s: reconnecting in %.1fs...", self.name, backoff)
+            log.info(
+                "[mcp] %s: reconnect attempt #%d in %.1fs "
+                "(last outcome: %s)",
+                self.name, attempt + 1, backoff,
+                error_class or "disconnect",
+            )
             if self._shutdown_event.wait(backoff):
+                log.info(
+                    "[mcp] %s: reconnect loop exiting (shutdown in backoff)",
+                    self.name,
+                )
                 break
 
-            backoff = min(backoff * 2, 60.0)
+            backoff = min(backoff * 2, MCP_RECONNECT_MAX_BACKOFF_SEC)
+
+        log.info("[mcp] %s: reconnect loop terminated", self.name)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -427,12 +483,30 @@ class MCPClient:
         self._shutdown_event.set()
         self._disconnect_event.set()
 
+        # Nudge the loop so run_until_complete returns promptly instead
+        # of waiting for a backoff. Safe to call from another thread;
+        # the resulting RuntimeError out of run_until_complete is caught
+        # in _connection_loop's generic except.
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception as e:
+                log.debug(
+                    "[mcp] %s: stop nudge failed: %s", self.name, e,
+                )
+
         if self._thread:
             self._thread.join(timeout=5)
             self._thread = None
 
-        if self._loop:
-            self._loop.close()
+        if self._loop is not None:
+            try:
+                self._loop.close()
+            except Exception as e:
+                log.debug(
+                    "[mcp] %s: final loop close failed: %s", self.name, e,
+                )
             self._loop = None
 
         self._session = None

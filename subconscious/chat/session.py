@@ -21,7 +21,7 @@ from typing import Dict, Optional
 
 from subconscious.runtime.config import SESSION_DIR
 
-log = logging.getLogger("chatd.session")
+log = logging.getLogger("subconscious.chat.session")
 
 _SESSIONS: Dict[str, "Session"] = {}
 
