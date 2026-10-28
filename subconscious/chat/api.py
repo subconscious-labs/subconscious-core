@@ -295,10 +295,57 @@ def extract_chat_id(flask_request) -> Optional[str]:
     return None
 
 
+def _extract_text_from_content(content: Any) -> str:
+    """Return plain text from a message content field.
+
+    Handles both shapes:
+      - str: as-is.
+      - list: OpenAI multimodal content array ([{"type": "text",
+        "text": "..."}, {"type": "image_url", ...}]). Text parts joined
+        with newlines; non-text parts (images, audio) dropped with a
+        warning. This is a defensive guard, not attachment support:
+        full ingress is deferred (ADR-004). Without it, an Open WebUI
+        request with its default multimodal shape crashes downstream
+        callers that assume str.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        log.warning(
+            "unexpected content type %s, treating as empty",
+            type(content).__name__,
+        )
+        return ""
+
+    text_parts: List[str] = []
+    dropped = 0
+    for part in content:
+        if isinstance(part, dict):
+            ptype = part.get("type")
+            if ptype == "text":
+                txt = part.get("text")
+                if isinstance(txt, str):
+                    text_parts.append(txt)
+            elif ptype is not None:
+                dropped += 1
+        elif isinstance(part, str):
+            # Some clients send a list of strings for content.
+            text_parts.append(part)
+    if dropped:
+        log.warning(
+            "dropped %d non-text content part(s) - attachments are not "
+            "supported yet, see ADR-004",
+            dropped,
+        )
+    return "\n".join(text_parts)
+
+
 def _last_user_text(messages: List[Dict]) -> str:
     for m in reversed(messages):
         if m.get("role") == "user":
-            return (m.get("content") or "")
+            return _extract_text_from_content(m.get("content"))
     return ""
 
 
@@ -407,7 +454,7 @@ def build_model_messages(
         role = m.get("role")
         if role not in ("system", "user", "assistant", "tool"):
             continue
-        content = m.get("content", "") or ""
+        content = _extract_text_from_content(m.get("content"))
         if role == "assistant":
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             # legacy cleanup - old sessions may contain [→ name] markers
