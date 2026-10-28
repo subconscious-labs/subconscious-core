@@ -1,224 +1,167 @@
-# subconscious: что сделано и что осталось
+# subconscious-core: status and roadmap
 
-## ✅ Сделано и проверено
+Updated: 2026-10-27
 
-### Инфраструктура и переименование (Stage 1)
-- Репозиторий переименован `chatd` → `subconscious-core`.
-- Env-префикс `CHATD_*` → `SUBCONSCIOUS_*` с fallback через `_env()` в `config.py`.
-- Systemd: `subconscious.service`, `subconscious-tick.timer` работают.
-- State переехал: `/opt/chatd/.local/share/chatd/` → `/var/lib/subconscious/`.
+## Done
 
-### Stage 2 (1–7)
-- **2.1–2.4:** FS-раскладка, пользователь `subconscious`, перенос state, конфиг.
-- **2.5:** `mcp_client.py` умеет HTTP-транспорт. mempalace подключён через HTTP.
-- **2.6:** `memory.py` без FastMemory и прямого KG - wake-up через MCP.
-- **2.7:** `chatd.py` без интерцептора `mempalace_kg_query`.
+### Infrastructure
 
-### PR C.5 - внутренние инструменты
-- `internal_tools.py`: `subcortex_goals_list/get/create/cancel`, `subcortex_journal_tail`.
-- Bulk cancel по списку id.
-- Регистрируются в `chatd.TOOLS`, недоступны фону через `BG_TOOLS_ALLOWED`.
-- Из чата управляют целями - проверено.
+- Repository `chatd` -> `subconscious-core`.
+- Env prefix `CHATD_*` -> `SUBCONSCIOUS_*` with `_env()` fallback.
+- systemd: `subconscious.service`, `subconscious-tick.timer`.
+- State moved to `/var/lib/subconscious/`.
 
-### Полировка planner/executor/reflector
-- `BG_SKIP_WITH_OPEN_GOALS_STOPS_TICK`, `BG_EXPLORATORY_MIN_INTERVAL_MIN`.
-- `useful` / `useful_reason` в exploratory observations.
-- Промпты в `prompts/*.txt` усилены.
-- `_read_recent_archive` - exploratory-учёт видит завершённые цели.
+### Package layout (2.9a, 2.9b)
 
-### DeepSeek Flash интеграция
-- `chat_sync` через стриминг (Flash в non-streaming обрывает reasoning).
-- `BG_NUM_PREDICT` работает (нужно 2048+ для reasoning).
-- `response_format="json"` включён для planner/reflector.
+- Flat modules moved into `subconscious/{runtime,chat,tools,worker,memory,events,backends}/`.
+- `worker/ledger.py` extracted from `worker/tick.py`.
+- `tools/registry.py` owns MCP client list; `worker/tick` and
+  `tools/internal` no longer import `chat.api`.
+- No deferred imports for cycle avoidance; leaf-module rule enforced.
+- Guard test: `tests/test_no_legacy_imports.py`.
 
-### Cloud budget + soft degrade
-- `SUBCONSCIOUS_BG_CLOUD_PREFIXES`, `_CLOUD_DAILY_TOKEN_BUDGET`, `_DEGRADE_MODEL`.
-- `_resolve_model()` деградирует фазу на локальную при исчерпании.
-- `degraded` в journal.
+### Backend normalization
 
-### Search fix
-- ONNX-модель примонтирована в mempalace-контейнер.
-- `mempalace_search`: 0.10s (было 40s таймаут).
+- Single internal shape (flat `tool_calls`, `thinking`, `done_reason`,
+  `usage`) across ollama, deepseek, openrouter, onnx.
+- DeepSeek cache-hit and cache-miss reported in `usage`.
+- Thinking dropped from history before backend call (DeepSeek rejects
+  `reasoning_content` on input).
+- DSML filter for DeepSeek Flash when tools stripped.
+- Documented in `docs/PROTOCOL.md`.
 
-### Truncation limits
-- Все через env: `BG_TOOL_RESULT_MAX_CHARS`, `BG_EXPLORATORY_SEED_MAX_CHARS`, `BG_OBSERVATION_SNIPPET_CHARS`, `BG_RECENT_OBSERVATIONS_LIMIT`, `CHAT_TOOL_RESULT_MAX_CHARS`, `MEMORY_KG_SNIPPET_LIMIT`.
+### Events
 
----
+- `events.sqlite3` with indexed queries.
+- Priority scale (critical / interactive / normal / background).
+- `event_get`, `event_list`, `event_link` internal tools.
+- `session_key` extraction from XMPP payloads (JID, MUC, self-echo
+  protection).
+- Per-session lock, deduplication by message id.
+- Event turns persisted to session log and RAG.
 
-## ✅ Сделано в этой сессии (Stage 2.75–2.85)
+### Identity and memory
 
-### Протокол: нормализация бэкендов
-- Единый внутренний shape для всех бэкендов:
-  - `message.thinking` (было `thinking` / `reasoning_content`)
-  - `message.tool_calls` - **плоский** `[{id, name, arguments}]` (было вложенное `{function: {name, arguments}}`)
-  - `done_reason` - во всех бэкендах (было только у некоторых)
-  - `usage` - объект с `prompt_tokens`/`completion_tokens`/`reasoning_tokens`/`cache_hit_tokens`/`cache_miss_tokens`
-- `backends/ollama.py` переписан с нормализацией в обе стороны.
-- `backends/deepseek.py` переписан: принимает flat, эмитит `thinking` + `usage`; cache hit/miss в логе.
-- `backends/openrouter.py`: извлечение `usage` и `finish_reason` из `chat_sync` (было хардкод `"stop"` и ноль токенов), `reasoning_content` → `thinking`.
-- `backends/base.py` - docstring с описанием нормализованного shape.
+- `identity.txt` moved to `/var/lib/subconscious/identity.txt`,
+  auto-created with generic default if missing.
+- `user_id` propagated through session turn and RAG. Filters by user
+  on retrieval; legacy chunks visible during migration.
+- KG snippet fallback via `meta_call` when mempalace is behind a proxy.
+- KG snippet fetched on wake-up; wake-up grown from 777 (identity only)
+  to ~6360 chars (identity + KG).
+- Cache invalidation on write tools called directly or via `meta_call`
+  (detected by `tool_ref`).
 
-### Протокол: типизированные события
-- Поле `event` верхнего уровня в NDJSON. Типы:
-  - `thinking` - `{delta}`
-  - `tool_call` - `{id, name, arguments}`
-  - `tool_result` - `{id, name, status, content}`
-  - `error`, `warning` - зарезервированы
-- События **не сохраняются** в историю клиента (display-only).
-- Хелперы `make_event_chunk`, `make_done_chunk`, `make_thinking_chunk` в `chatd.py`.
-- `/api/generate` пробрасывает `event` и `usage`.
-- `event.type` - строковый дискриминатор, расширяемо без версионирования.
+### Background worker (subcortex)
 
-### Протокол: dual-channel thinking для Hollama
-- Hollama читает `message.thinking` (Ollama-native), поэтому thinking эмитится **двумя каналами**:
-  - `message.thinking` - для Hollama
-  - `event.type=thinking` - для event-aware клиентов
-- В `build_model_messages` thinking удаляется из истории assistant-сообщений перед backend (DeepSeek отклоняет `reasoning_content` в input на части версий API).
+- Planner / executor / reflector with per-phase models.
+- Goal ledger with `partials` counter distinct from `attempts`.
+- `partial` outcome keeps goal pending; `blocked` after partial cap
+  routes through `_apply_failure` and Reflector.
+- Self-healing: `close_orphaned_ticks` at startup, closes `started`
+  entries older than `BG_TICK_TIMEOUT`.
+- Age filter on observations: `BG_OBSERVATION_MAX_AGE_HOURS=24`.
+  Planner does not resurrect already-fixed problems.
+- Prompt source logged at WARNING level (survives startup before
+  `logging.basicConfig`).
+- Executor prompt forbids creating `new_goals` to unblock a partial.
+- `MAX_TOOL_ROUNDS` reduced from 150 to 12; background tick rounds
+  = 3.
 
-### Протокол: DSML-фильтр
-- `DSMLFilter` - stateful: буферизует от `｜` до newline, дропает строку с маркером.
-- `_strip_dsml` (одноразовый) и `_contains_dsml` для non-streaming путей.
-- Fallback-инструкция `"no tools, plain text only"` для последнего раунда (DeepSeek Flash иначе эмитит DSML-текст).
-- `think_remapper.py` - **удалён**, его функция поглощена event-каналом.
+### Documentation
 
-### Cache-aware транспорт
-- **RAG-инъекция переехала из system в последнее user-сообщение** - ключевая оптимизация.
-  - `ensure_system_prompt` копирует messages и дописывает RAG-блок к последнему user.
-  - `clean_user` параметр в `chat_stream_generator` - сессия и RAG-индекс получают **оригинальный** user-текст, а не аугментированный.
-  - `chat()` захватывает `original_user` до инъекции.
-- **DeepSeek stream usage** - `stream_options={"include_usage": True}`, единый done=True чанк на `[DONE]` с usage/tool_calls/done_reason.
-- **Summary в фоне сохраняет tools** - не сбрасывает prefix cache; fallback на tools=None если модель не подчиняется.
-- Результат в цифрах:
-  - Чат: 90–99% cache_hit (было ~0)
-  - Фон: ~70% за тик (по архитектуре ниже - уникальный контент на каждом шаге)
-  - Summary: 9728/9904 hit (было 3584/4853)
+- `docs/adr/ADR-001-thinking-loop.md`
+- `docs/adr/ADR-002-package-layout.md`
+- `docs/adr/ADR-003-memory.md`
+- `docs/adr/ADR-004-deferred.md`
+- `docs/PROTOCOL.md`
+- `docs/OPERATIONS.md`
 
-### Killer bug: фон не мог вызывать инструменты
-- `background._execute_tool_call` читал **старый вложенный** формат `tc.get("function")`.
-- После нормализации бэкендов `fn` был пуст → `name="unknown"` → `BG_TOOLS_ALLOWED` отбрасывал всё.
-- Симптом: все tool-результаты `52 chars`, planner честно писал `tool not allowed in background: unknown`.
-- Исправлено в `_execute_tool_call` и в exploratory seed path.
-- Добавлен `log.warning` при reject.
-- **Побочный эффект:** 4 воркер-цели про «пустой allowlist / guard / unknown tool» были созданы на основе этого симптома и отменены вручную после фикса.
+## Open now
 
-### Косметика и защита
-- `_tc_signature` и `run_tool_loop` - плоский формат.
-- `build_model_messages` чистит legacy `[→ name]` и `<think>…</think>` для старых сессий.
-- `/tags` дедуплицирует по `model`/`name` - если одна модель пришла и из Ollama, и из OpenRouter, остаётся одна запись.
-- `_run_with_timeout` - задокументированный trade-off (daemon thread продолжает бежать после таймаута).
+### Immediate
 
----
+- **`KG_SNIPPET_TIMEOUT`**: cap KG fetch at 10s to prevent 60s stall
+  on first event after restart when mempalace is cold. ~20 lines in
+  `memory/wakeup.py` + `config.py`.
+- **Defensive guard for multimodal content**: `isinstance(content,
+  str)` check in `_last_user_text`, `build_model_messages`,
+  `ensure_system_prompt`. Prevents crash when Open WebUI sends
+  multimodal shape by default. ~10 lines. Include in 2.9c.
+- **Stage 2.9c**: split `chat/api.py` into `chat/{api,stream,
+  tools_loop,prompt,event}.py` + tests (see
+  `tests/README.md` plan).
 
-## ⚠️ Не доделано
+### Backlog (small, well-scoped)
 
-### P0 - было в backlog до этой сессии
+- `partials=0` on Reflector `retry` (currently only `attempts`
+  resets; after retry the goal quickly accumulates partials again).
+- Stale-goal detection: pending > N hours without movement → cancel
+  or mark stale (ADR-004).
+- Capability-gap detection: same missing-capability across partials →
+  escalate directly (ADR-004).
+- `event_peek` non-blocking queue check (ADR-004).
+- `wing_elsa` in canonical wing list, or tighten diary prompt
+  (ADR-004).
+- `_EVENT_DIRECTIVE` rule for simple pings (ADR-004).
+- RAG deduplication: do not inject chunks from current session when
+  similarity is very high and the same source is already in history.
 
-1. **`mcp_client.py`** - двойной префикс `MCP_ENV_PREFIXES` **сделан** (см. ниже). Осталось: убедиться, что нигде не осталось `MCP_ENV_PREFIX` в единственном числе - grep по репо.
-2. **`memory.py`** - `LAYER_15_ENABLED` через `_env()` - **не проверял в этой сессии**, вероятно ещё актуально.
-3. **`config.py`** - мёртвая `MCP_ENV_PREFIX`, `_load_bg_prompt` через `_env` - **не проверял**.
-4. **`.env.example`** - три места (`SUBCONSCIOUS_STDIO_MCP_*` порядок слов, `mempalace_wake_up` в allowlist, комментарии про `BG_DEGRADE_MODEL`) - **не проверял**.
+### Medium (PR D)
 
-Из них **пункт 1 сделан в этой сессии:**
-- `discover_mcp_servers()` обходит `MCP_ENV_PREFIXES` в порядке приоритета.
-- `key[len(prefix):]` работает корректно для любого из префиксов.
-- Старший префикс маскирует младший (SUBCONSCIOUS > CHATD).
+- Assess phase after Executor: verify that a `done` goal was actually
+  accomplished.
+- `parent_goal_id` for goal lineage, addressing sub-goals-of-sub-goals
+  trees.
+- Token usage for OpenRouter (code exists, needs live test).
+- Minimal A2A: Agent Card + Task mapping.
 
-### P1 - может подождать
+### Large (PR E, after PR D)
 
-5. **`_run_with_timeout`** - daemon thread остаётся живым при таймауте. Задокументировано.
-6. **Concurrency:** `run_tick` держит `TickLock` всю длительность тика. Из чата `subcortex_goals_*` берут тот же lock с таймаутом 5s. В PR D - разделить на `tick.lock` и `ledger.lock`.
-7. **`num_predict=380000`** - вернуть к 8192. DeepSeek клампит, но полагаться нельзя.
-8. **OpenRouter `chat_sync`** - extraction `usage` добавлена в этой сессии (см. выше), но эффект не проверялся без трафика через `or/`.
+- `memory/hot` MVP: SQLite + sqlite-vec + FTS5 + RRF + forgetting
+  + escalate + warmup + rebuild.
+- Invariant: forgetting = demotion, never deletion.
+- Escalation rate in log from day one.
+- ADR for hot-tier design (already drafted as ADR-003).
 
-### P2 - дизайн-долг, извлечённый из этой сессии
+### Backlog (no date)
 
-9. **Failure-lineage целей** - failed-цель плодит цель про причину провала. За 4 итерации одна проблема размножается в 5 целей. Держит только `BG_MAX_OPEN_GOALS=5`. Три идеи на PR D:
-   - **Supersede**: заменять похожую открытую цель вместо создания рядом.
-   - **Failure-lineage counter**: при done/cancelled родителя автоматически снимать производные.
-   - **Stale by `based_on`**: помечать цель устаревшей, если observation, на которой она основана, больше не соответствует реальности.
-10. **`_read_recent_observations`** - окно 12 непустых `last_result` воскрешает уже починенный баг. После fix симптома planner ещё 1–2 тика может видеть старые наблюдения и пытаться расследовать несуществующую проблему.
-11. **Write-tools для воркера** - цели типа KG-дедупа (`kg_supersede`, `kg_invalidate`) не выполнимы в read-only воркере. Три варианта:
-    - **Propose-then-confirm**: воркер создаёт patch-цель, ждёт апрува человеком.
-    - **Narrow write-allowlist**: 2–3 инструмента с audit-логом.
-    - **`BG_WRITE_ENABLED=false/true`**: при `false` write-цели помечаются `requires_manual` вместо failed.
-12. **Серверная история** - клиент шлёт `chat_id + new_message`, chatd восстанавливает историю из session. Решает и кэш после tool-сессий (сейчас 13696/77123 - падение до системного префикса, потому что Hollama не сохраняет tool_calls), и открывает дорогу к своему клиенту.
+- Attachments ingress/egress (ADR-004, PR G).
+- A2A blocking wait with correlation_id (ADR-004).
+- Argument-level tool gating with shadow-first rollout and one-use
+  permits.
+- PR F: multi-agent, workspace reservation, full A2A.
+- DAG of goals with dependencies.
+- CLI & Skills: safe MCP proxy for shell + lazy-load instructions.
+- `soothe-nano` for code editing.
+- Plugin system.
 
----
+## When to enable the timer
 
-## 📋 Stage 2.8 и 2.9 (плановые)
+The `subconscious-tick.timer` is **disabled by default** on dev
+installs and during the current debugging cycle. Enable it when:
 
-### Stage 2.8 - systemd переименование
-- Симлинки старых имён.
-- Проверка `SUBCONSCIOUS_*` без fallback-warning'ов.
-- Env-переменные в `/etc/subconscious/subconscious.env` под новыми именами.
+1. **Before PR D.** Assess evaluates accumulated done goals; without a
+   regular tick there is nothing to assess.
+2. **Before memory/hot MVP.** Decay and consolidation are tested over
+   time; a manual tick cannot validate them.
+3. **Before leaving the system unattended.** Autonomous observation
+   requires a regular tick.
+4. **Before multi-user.** Background observations must run for all
+   users, not just when the operator triggers a manual tick.
 
-**Оценка:** 1 час.
+Not a reason to enable:
+- "I want to see exploratory work" (2-3 manual ticks show the same).
+- "I want to test cloud budget degrade" (rare event, manual triggers
+  find it).
+- "I want to test orphan self-healing" (manual: restart mid-tick and
+  check log).
 
-### Stage 2.9 - реструктуризация в пакет `subconscious/`
-- `subconscious/{core,cortex,thalamus,subcortex}/`
-- `git mv`:
-  - `chatd.py` → `subconscious/cortex/api.py`
-  - `background.py` → `subconscious/subcortex/tick.py`
-  - `memory.py`, `rag.py`, `session.py`, `config.py` → `subconscious/core/`
-  - `mcp_client.py` → `subconscious/thalamus/mcp/client.py`
-  - `mcp_registry.py` → `subconscious/core/registry.py`
-  - `backends/` → `subconscious/thalamus/backends/`
-- Разорвать циклический `subcortex → cortex` (`import chatd` → `from subconscious.core import registry`).
-- Пути к `prompts/` и `tool_descriptions.ini` через `Path(__file__).resolve().parent.parent.parent`.
-- Shim-файлы в корне, `pyproject.toml`, `pip install -e .`.
-- Systemd unit: `subconscious.cortex.api:app`.
+## References
 
-**Оценка:** этап 1 - 40 мин, этап 2 - 20 мин.
-
----
-
-## 🎯 Roadmap после 2.9
-
-### PR D - замыкание StrangeLoop
-- **Assess-фаза** после Executor (оценка done-целей).
-- **`parent_goal_id`** - lineage целей + чистка по failure-lineage.
-- **Token usage для OpenRouter** - сделано, нужен smoke.
-- **A2A: Agent Card + Task mapping** (минимум).
-- **Свой KG на SQLite** (часть PR E).
-
-### PR E - своя память
-- Свой KG (~200 строк), `sqlite-vec`, свой identity loader.
-- Mempalace за MCP как источник старых данных.
-- `mcp_servers.yaml` для thalamus.
-
-### PR F - multi-agent
-- Worker pool, workspace reservation.
-- A2A полный: Message, Artifact, push notifications.
-- Multi-host.
-
-### Backlog
-- DAG целей с зависимостями.
-- LangGraph-подобное планирование.
-- soothe-nano для редактирования кода.
-- Плагины.
-
----
-
-## 📝 Документы в репо
-
-- `docs/GOALS.md` - манифест проекта.
-- `docs/ARCHITECTURE.md` - четыре зоны, FS-раскладка, внешние сервисы.
-- `docs/RENAME.md` - план переименования.
-
-**Не хватает:**
-- `docs/adr/` - три ADR (backends, memory, mcp).
-- `docs/OPERATIONS.md` - бэкапы, runbooks.
-- **`docs/PROTOCOL.md`** - спецификация нормализованного shape + event-канал. Появилось в этой сессии, надо зафиксировать письменно.
-- Обновить `README.md` - местами ещё старое название.
-
----
-
-## 🏁 Следующий шаг
-
-Три параллельных трека:
-
-1. **Закрыть оставшиеся P0 из backlog** - проверить `memory.py`, `config.py`, `.env.example` на три оставшихся пункта (нужен grep по репо).
-2. **Дописать `docs/PROTOCOL.md`** - нормализованный shape, event-типы, dual-channel thinking, DSML-фильтр. Сейчас это живёт только в коде.
-3. **Stage 2.8 → 2.9** - переименование systemd, потом реструктуризация в пакет.
-
-После этого - `pre-2.9` тег и старт PR D.
+- `docs/adr/ADR-001-thinking-loop.md` - architecture.
+- `docs/adr/ADR-002-package-layout.md` - module layout.
+- `docs/adr/ADR-003-memory.md` - memory tiering decision.
+- `docs/adr/ADR-004-deferred.md` - deferred decisions.
+- `docs/PROTOCOL.md` - wire formats.
+- `docs/OPERATIONS.md` - runbooks.

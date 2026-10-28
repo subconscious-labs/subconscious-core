@@ -1,79 +1,72 @@
 # subconscious-core
 
-Tooling for autonomous neural agents that run in your infrastructure,
-accumulate knowledge about their environment, and stay in the loop with you.
+Autonomous agent runtime for your infrastructure. One process, one
+thinking loop, memory that survives restarts.
 
-This is the core package: a chat interface, a background thinker, a memory
-layer, and a router to LLMs and MCP tools. Bring your own infrastructure,
-your own models, and your own goals - subconscious-core handles the rest.
-
-**Docs:** [GOALS.md](docs/GOALS.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md)
+**Docs:** [ADR-001](docs/adr/ADR-001-thinking-loop.md) ·
+[ADR-002](docs/adr/ADR-002-package-layout.md) ·
+[ADR-003](docs/adr/ADR-003-memory.md) ·
+[ADR-004](docs/adr/ADR-004-deferred.md) ·
+[PROTOCOL](docs/PROTOCOL.md) · [OPERATIONS](docs/OPERATIONS.md)
 
 ## What it is
 
-Not a framework. Not a SaaS. A ready-to-run application for one kind of
-agent: the one that lives next to your servers, notices things, investigates
-(read-only), remembers what it found, and asks before acting.
+An application, not a framework. One agent that notices events,
+investigates (read-only), remembers findings, asks before acting.
 
-A typical deployment:
+Typical deployment:
 
 ```
 you  ──chat──►  subconscious-core  ──►  LLM (local or cloud)
                        │
                        ├──►  MCP tools  (monitor, alerts, notes, ssh, git…)
-                       ├──►  memory     (KG, RAG, sessions)
-                       └──►  subcortex  (planner → executor → reflector)
+                       ├──►  memory     (KG, RAG, sessions, events)
+                       └──►  worker     (planner → executor → reflector)
                                              ↑
                                         systemd timer
 ```
 
-The agent is autonomous in:
-- **investigation** - read-only everywhere;
-- **writing** - to its own state files;
-- **its memory**.
+## Four conceptual zones
 
-Everything else goes through you.
+| Zone | Responsibility | Module |
+|---|---|---|
+| **runtime** | data, config, budgets, lifecycle | `subconscious/runtime/` |
+| **chat** | interfaces outward (HTTP, session) | `subconscious/chat/` |
+| **tools** | bindings (LLM backends, MCP client, tool routing) | `subconscious/tools/` |
+| **worker** | background thinking (planner, executor, reflector) | `subconscious/worker/` |
 
-## Four zones
+Memory and events are shared services:
 
-`subconscious-core` is organized in four zones, each with one job:
+| Service | Responsibility | Module |
+|---|---|---|
+| **memory** | wake-up, RAG, hot/cold tiers | `subconscious/memory/` |
+| **events** | event ledger and session key extraction | `subconscious/events/` |
 
-| Zone | Responsibility |
-|---|---|
-| **core** | data and state - memory, KG, ledger, sessions, budget |
-| **cortex** | interfaces outward - chat, events, A2A, CLI |
-| **thalamus** | bindings - LLM backends, MCP client, tool routing |
-| **subcortex** | background thinking - planner, executor, reflector |
-
-Chat is a *cortex* concern, not the core of the project. The subcortex is
-where autonomy lives.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full picture.
+The `cortex / thalamus / subcortex` terminology used elsewhere in docs
+is conceptual, not navigational. Module paths are functional. See
+[ADR-002](docs/adr/ADR-002-package-layout.md).
 
 ## Features
 
-- **Chat interface** - NDJSON streaming, tool loop, layered memory injection.
-- **Background thinker** - hourly tick, three phases (planner → executor →
-  reflector), goal ledger with attempts, history, archive.
-- **Exploratory mode** - when there are no open goals, the agent performs a
-  read-only observation, rotating through available tools.
-- **Layered memory** - identity (L0), wake-up (L1), and a request-scoped
-  sidecar (L1.5) built from KG recall and RAG.
-- **MCP tool dispatch** - the agent sees MCP servers as tools; the list is
-  filtered per phase (chat sees more than the background worker).
-- **Multi-backend routing** - Ollama, OpenRouter, DeepSeek, ONNX. Selected
-  by model name prefix.
-- **Layered configuration** - code defaults, `/etc/subconscious/`,
-  `~/.config/subconscious/`, then env vars. Later sources win.
-- **A2A compatibility (in progress)** - Agent Card and Task mapping so other
-  agents can talk to this one.
+- **Chat interface** - NDJSON streaming, tool loop, layered memory
+  injection, Open WebUI compatible.
+- **Background worker** - planner → executor → reflector, goal ledger
+  with attempts and partials, self-healing on restart.
+- **Event loop** - one thinking lock per turn; XMPP, email, WebUI,
+  alerts all arrive as events with priority and correlation.
+- **Layered memory** - identity (L0), wake-up (L1), request-scoped
+  RAG sidecar (L1.5). Hot/cold tiering planned (ADR-003).
+- **MCP tool dispatch** - discover, route, reconnect, restart servers.
+  Push notifications received as events.
+- **Multi-backend** - Ollama, DeepSeek, OpenRouter, ONNX. Selected by
+  model name prefix.
 
 ## Requirements
 
 - Python 3.11+
-- An LLM endpoint: Ollama (local), or API keys for cloud backends
+- An LLM endpoint: Ollama (local), DeepSeek API, or OpenRouter
 - Optional: MCP servers for the tools you want the agent to use
-- Optional: mempalace for the legacy memory layer
+- Optional: MemPalace for the cold memory tier
 
 ## Quick start
 
@@ -83,7 +76,7 @@ cd subconscious-core
 
 python3 -m venv venv
 . venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 
 cp .env.example .env
 $EDITOR .env
@@ -93,17 +86,87 @@ Minimum to get a chat running:
 
 ```sh
 OLLAMA_API=http://127.0.0.1:11434
-SUBCONSCIOUS_MCP_MEMPALACE=/opt/subconscious/venv/bin/python -m mempalace.mcp_server
-MEMPALACE_PALACE_PATH=/var/lib/mempalace
+SUBCONSCIOUS_MCP_HTTP_LAZY_URL=http://127.0.0.1:3333/mcp
+SUBCONSCIOUS_MCP_HTTP_LAZY_TOKEN=<token>
 ```
 
 Run:
 
 ```sh
-python chatd.py
+python -m subconscious.chat.api
 ```
 
 Or via systemd - see `subconscious.service.example`.
+
+## Layout
+
+```
+subconscious/
+  runtime/       config, defaults, paths
+  chat/          Flask routes, session, prompt assembly, streaming
+  tools/         MCP client, tool registry, internal tools
+  worker/        planner/executor/reflector, goal ledger, prompts
+  memory/        wake-up, RAG, hot/cold tiers (stubs)
+  events/        event ledger (SQLite)
+  backends/      ollama, deepseek, openrouter, onnx
+```
+
+## Configuration
+
+Layered lookup: code defaults < `/etc/subconscious/` <
+`~/.config/subconscious/` < env vars. Later sources win.
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_API` | `http://127.0.0.1:11434` | Ollama endpoint |
+| `SUBCONSCIOUS_MCP_HTTP_<NAME>_URL` | *(unset)* | HTTP MCP server |
+| `SUBCONSCIOUS_MCP_HTTP_<NAME>_TOKEN` | *(unset)* | Bearer token |
+| `SUBCONSCIOUS_MCP_STDIO_<NAME>` | *(unset)* | stdio MCP command |
+| `SUBCONSCIOUS_MAX_TOOL_ROUNDS` | `12` | Max tool rounds per chat |
+| `SUBCONSCIOUS_MAX_HISTORY_TURNS` | `20` | History window (turns) |
+| `SUBCONSCIOUS_RAG_ENABLED` | `true` | Enable L1.5 RAG |
+| `SUBCONSCIOUS_BG_ENABLED` | `false` | Enable background worker |
+| `SUBCONSCIOUS_BG_MODEL` | `qwen3.5:9b` | Fallback model |
+| `SUBCONSCIOUS_BG_MODEL_PLANNER` | *(unset)* | Override planner |
+| `SUBCONSCIOUS_BG_MODEL_EXECUTOR` | *(unset)* | Override executor |
+| `SUBCONSCIOUS_BG_MODEL_REFLECTOR` | *(unset)* | Override reflector |
+| `SUBCONSCIOUS_BG_OBSERVATION_MAX_AGE_HOURS` | `24` | Observation freshness filter |
+| `SUBCONSCIOUS_BG_MAX_OPEN_GOALS` | `5` | Open goals cap |
+| `SUBCONSCIOUS_BG_CLOUD_DAILY_TOKEN_BUDGET` | `0` | Cloud token limit (0=unlimited) |
+| `SUBCONSCIOUS_EVENT_MODEL` | *(unset)* | Model for incoming events |
+| `SUBCONSCIOUS_EVENT_TOKEN` | *(unset)* | Bearer for `/api/event` |
+
+Full list: `.env.example`.
+
+**Backward compatibility:** `CHATD_*` env vars continue to work as
+fallbacks; deprecation warning on first use.
+
+## Backends
+
+Routing by model prefix:
+
+| Prefix | Backend | Notes |
+|---|---|---|
+| *(none)* | Ollama | local over HTTP |
+| `or/` | OpenRouter | OpenAI-compatible |
+| `deepseek/` | DeepSeek | API with prefix caching |
+| `onnx/` | ONNX Runtime | embed only |
+
+Add a backend by implementing `BackendProtocol` in
+`subconscious/backends/base.py`.
+
+## Memory layers
+
+| Layer | Source | Content | When |
+|---|---|---|---|
+| L0 | MemPalace | identity | always |
+| L1 | MemPalace | KG timeline | always |
+| L1.5 | subconscious | RAG recall + (planned) `user_context` | per request |
+| L2 | MemPalace | room recall | on topic |
+| L3 | MemPalace | deep search | on ask |
+
+L1.5 (RAG) is injected into the **last user message**, not the system
+block, to preserve prefix cache. See [PROTOCOL](docs/PROTOCOL.md#cache-preservation-rules).
 
 ## Background thinking
 
@@ -112,9 +175,10 @@ Enable and configure in `/etc/subconscious/subconscious.env`:
 ```sh
 SUBCONSCIOUS_BG_ENABLED=true
 SUBCONSCIOUS_BG_TOKEN=<random-secret>
-SUBCONSCIOUS_BG_MODEL=qwen3.5:9b
-SUBCONSCIOUS_BG_MODEL_PLANNER=qwen3.5:4b
-SUBCONSCIOUS_BG_MODEL_REFLECTOR=qwen3.5:4b
+SUBCONSCIOUS_BG_MODEL=deepseek/deepseek-flash
+SUBCONSCIOUS_BG_MODEL_PLANNER=deepseek/deepseek-flash
+SUBCONSCIOUS_BG_MODEL_EXECUTOR=deepseek/deepseek-flash
+SUBCONSCIOUS_BG_MODEL_REFLECTOR=deepseek/deepseek-flash
 ```
 
 Trigger manually:
@@ -125,87 +189,53 @@ curl -X POST http://127.0.0.1:5001/api/tick \
   -d '{}'
 ```
 
-Or install the timer: `subconscious-tick.timer` fires hourly, calls the
-endpoint, and the agent does one tick of thinking.
+Or enable the hourly timer:
 
-All background state lives in `~/.local/share/subconscious/bg/`:
+```sh
+systemctl enable --now subconscious-tick.timer
+```
 
-- `goals.json` - active goals (pending, active, blocked)
-- `goals.archive.jsonl` - completed and cancelled goals
+State lives in `/var/lib/subconscious/bg/`:
+
+- `goals.json` - active goals
+- `goals.archive.jsonl` - completed and cancelled
 - `journal.jsonl` - append-only tick log
 - `budget.json` - daily token and time counters
-- `seed_rotation.json` - which exploratory tool to use next
 - `tick.lock` - flock, prevents overlapping ticks
 
-## Configuration
+See [OPERATIONS](docs/OPERATIONS.md) for runbooks and when to enable
+the timer.
 
-Layered lookup: `code defaults` < `/etc/subconscious/` < `~/.config/subconscious/` < `env`.
+## Tests
 
-| Variable | Default | Description |
-|---|---|---|
-| `OLLAMA_API` | `http://127.0.0.1:11434` | Ollama endpoint |
-| `SUBCONSCIOUS_THINKING` | `false` | Enable model extended thinking |
-| `SUBCONSCIOUS_MAX_TOOL_ROUNDS` | `5` | Max tool rounds per chat request |
-| `SUBCONSCIOUS_MAX_HISTORY_TURNS` | `20` | History window (user+assistant pairs) |
-| `SUBCONSCIOUS_RAG_ENABLED` | `true` | Enable L1.5 RAG sidecar |
-| `SUBCONSCIOUS_RAG_DB_PATH` | `~/.local/share/subconscious/rag.sqlite3` | RAG store |
-| `MEMPALACE_PALACE_PATH` | `~/.local/share/mempalace` | mempalace palace directory |
-| `MEMPALACE_KG_PATH` | `~/.mempalace/knowledge_graph.sqlite3` | mempalace KG |
-| `DEEPSEEK_API_KEY` | *(unset)* | DeepSeek API key |
-| `OPENROUTER_API_KEY` | *(unset)* | OpenRouter API key |
-| `SUBCONSCIOUS_BG_ENABLED` | `false` | Enable background worker |
-| `SUBCONSCIOUS_BG_TOKEN` | *(unset)* | Bearer token for `/api/tick` |
-| `SUBCONSCIOUS_BG_MODEL` | `qwen3.5:9b` | Fallback model for all phases |
-| `SUBCONSCIOUS_BG_MODEL_PLANNER` | *(unset)* | Planner model override |
-| `SUBCONSCIOUS_BG_MODEL_EXECUTOR` | *(unset)* | Executor model override |
-| `SUBCONSCIOUS_BG_MODEL_REFLECTOR` | *(unset)* | Reflector model override |
+```sh
+pytest -v
+```
 
-Full list: `.env.example`.
+Notable:
 
-**Backward compatibility:** all `CHATD_*` env vars continue to work as
-fallbacks. The agent logs a deprecation warning when it sees one.
-
-## Overriding background prompts
-
-Background prompts (planner, executor, exploratory, reflector) ship as
-plain-text files in `prompts/`. They can be overridden per host or per user
-without editing code:
-
-1. `prompts/<name>.txt` - bundled default (in repo)
-2. `/etc/subconscious/prompts/<name>.txt` - system override
-3. `~/.config/subconscious/prompts/<name>.txt` - user override
-4. `SUBCONSCIOUS_BG_PROMPT_<NAME>` env var - runtime override
-
-Later sources win. Four names: `planner`, `executor`, `exploratory`,
-`reflector`.
-
-## Backends
-
-Routing is by model prefix:
-
-| Prefix | Backend | Notes |
-|---|---|---|
-| *(none)* | `OllamaBackend` | local Ollama over HTTP |
-| `or/` | `OpenRouterBackend` | OpenAI-compatible cloud API |
-| `deepseek/` | `DeepSeekBackend` | DeepSeek API |
-| `onnx/` | `OnnxBackend` | ONNX encoder - embed only |
-
-Add a backend by implementing `BackendProtocol` (`subconscious/thalamus/backends/base.py`).
+- `tests/test_no_legacy_imports.py` - guards against post-move flat
+  module imports.
+- `tests/test_background.py` - goal ledger, JSON extraction, plan
+  behaviour.
+- `tests/test_events.py` - event store, priority, status transitions.
+- `tests/test_user_identity.py` - user_id propagation, RAG filter,
+  session state.
 
 ## Related projects
 
 Part of [`subconscious-labs`](https://github.com/subconscious-labs):
 
-- [gonnx](https://github.com/subconscious-labs/gonnx) - ONNX runtime with Git-based model bundles
-- [lazy-mcp](https://github.com/subconscious-labs/lazy-mcp) - lazy MCP proxy with meta-tools
-- [tts-api](https://github.com/subconscious-labs/tts-api) - multi-engine TTS server (REST + MCP)
-- [dav-mcp](https://github.com/subconscious-labs/dav-mcp) - CalDAV/CardDAV MCP server
-- [time-mcp](https://github.com/subconscious-labs/time-mcp) - time/date MCP server
+- [lazy-mcp](https://github.com/subconscious-labs/lazy-mcp) - lazy MCP proxy
+- [gonnx](https://github.com/subconscious-labs/gonnx) - ONNX runtime
+- [tts-api](https://github.com/subconscious-labs/tts-api) - TTS MCP server
+- [dav-mcp](https://github.com/subconscious-labs/dav-mcp) - CalDAV/CardDAV MCP
+- [time-mcp](https://github.com/subconscious-labs/time-mcp) - time MCP
 
 ## Status
 
-Early. The core works, the docs describe where it's going. See
-[docs/GOALS.md](docs/GOALS.md) for the roadmap.
+Early. Core works; docs describe where it is going. See
+[todo.md](todo.md) for current state and roadmap.
 
 ## License
 
