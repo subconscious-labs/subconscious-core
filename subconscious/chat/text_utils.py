@@ -40,7 +40,15 @@ _DSML_TRIGGER = "｜"
 
 
 class DSMLFilter:
-    """Stateful stripper for DeepSeek DSML tool-call markup."""
+    """Stateful stripper for DeepSeek DSML tool-call markup.
+
+    The marker is `<｜｜DSML｜｜ ...`. A `<` on its own is normal text
+    (HTML, markdown, comparison); a `｜` on its own is unusual but legal.
+    Only `<` immediately followed by `｜` begins a candidate marker.
+    The filter holds a `<` for one character of lookahead: if the next
+    char is `｜`, it starts buffering from the `<` (so the marker match
+    includes the leading `<`); otherwise it emits the `<` and continues.
+    """
 
     MARKER = _DSML_MARKER
     TRIGGER = _DSML_TRIGGER
@@ -49,14 +57,29 @@ class DSMLFilter:
     def __init__(self) -> None:
         self._buf = ""
         self._in_buffer = False
+        self._pending_lt = False
 
     def feed(self, text: str) -> str:
         if not text:
             return ""
         out: List[str] = []
         for ch in text:
-            if not self._in_buffer:
+            # If the previous char was `<`, decide now whether it starts
+            # a DSML marker. Either way, resolve pending_lt before this
+            # character is handled by the main branch below.
+            if self._pending_lt:
                 if ch == self.TRIGGER:
+                    self._in_buffer = True
+                    self._buf = "<" + ch
+                    self._pending_lt = False
+                    continue
+                out.append("<")
+                self._pending_lt = False
+
+            if not self._in_buffer:
+                if ch == "<":
+                    self._pending_lt = True
+                elif ch == self.TRIGGER:
                     self._in_buffer = True
                     self._buf = ch
                 else:
@@ -75,15 +98,23 @@ class DSMLFilter:
         return "".join(out)
 
     def flush(self) -> str:
-        """Return anything still buffered at stream end."""
-        if not self._in_buffer:
-            return ""
-        leftover = self._buf
-        self._buf = ""
-        self._in_buffer = False
-        if self.MARKER in leftover:
-            return ""
-        return leftover
+        """Return anything still buffered at stream end.
+
+        Both the pending `<` and the in-buffer content are resolved
+        here: pending `<` is emitted (it was not followed by `｜`), and
+        buffered content is emitted unless it contains the DSML marker.
+        """
+        out: List[str] = []
+        if self._pending_lt:
+            out.append("<")
+            self._pending_lt = False
+        if self._in_buffer:
+            leftover = self._buf
+            self._buf = ""
+            self._in_buffer = False
+            if self.MARKER not in leftover:
+                out.append(leftover)
+        return "".join(out)
 
 
 def _strip_dsml(text: str) -> str:
