@@ -223,11 +223,27 @@ BG_TOOLS_ALLOWED: Set[str] = set(
 BG_MODEL_PLANNER: str = _env("BG_MODEL_PLANNER", "")
 BG_MODEL_EXECUTOR: str = _env("BG_MODEL_EXECUTOR", "")
 BG_MODEL_REFLECTOR: str = _env("BG_MODEL_REFLECTOR", "")
+# Assessor (PR D). Evaluates freshly-done goals: did the executor
+# actually accomplish what it claimed? In D2 the verdict is recorded
+# in goal.history but the goal's status is not changed. D3 will act
+# on it. Falls back to reflector model, then BG_MODEL.
+BG_MODEL_ASSESSOR: str = _env("BG_MODEL_ASSESSOR", "")
 # Reserved for PR D (escalation on repeated failure). Declared now, unused.
 BG_MODEL_THINK: str = _env("BG_MODEL_THINK", "")
 
 # Per-phase timeouts (seconds). Executor gets more room for its tool loop.
 BG_PHASE_TIMEOUT: int = int(_env("BG_PHASE_TIMEOUT", "600"))
+# Assessor timeout. One LLM call, no tool loop. Same order of
+# magnitude as planner; the assessor does not iterate.
+BG_PHASE_TIMEOUT_ASSESSOR: int = int(
+    _env("BG_PHASE_TIMEOUT_ASSESSOR", "300")
+)
+
+# Master switch. When false, no assessor call is made and done goals
+# are recorded without an `assessed` field.
+BG_ASSESS_ENABLED: bool = (
+    _env("BG_ASSESS_ENABLED", "true").lower() == "true"
+)
 BG_PHASE_TIMEOUT_EXECUTOR: int = int(_env("BG_PHASE_TIMEOUT_EXECUTOR", "1500"))
 # Per-phase timeout for exploratory ticks. Exploratory does one deterministic
 # seed tool call and one LLM call - no tool loop - so it needs less headroom
@@ -411,7 +427,9 @@ BG_WAKEUP_MODE_EXECUTOR: str = _env("BG_WAKEUP_MODE_EXECUTOR", "")
 BG_WAKEUP_MODE_REFLECTOR: str = _env("BG_WAKEUP_MODE_REFLECTOR", "")
 BG_WAKEUP_MODE_EXPLORATORY: str = _env("BG_WAKEUP_MODE_EXPLORATORY", "")
 
+
 BG_PROMPT_PLANNER: str = _load_bg_prompt("planner")
 BG_PROMPT_EXECUTOR: str = _load_bg_prompt("executor")
 BG_PROMPT_EXPLORATORY: str = _load_bg_prompt("exploratory")
 BG_PROMPT_REFLECTOR: str = _load_bg_prompt("reflector")
+BG_PROMPT_ASSESSOR: str = _load_bg_prompt("assessor")

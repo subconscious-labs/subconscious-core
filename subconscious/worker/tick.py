@@ -51,6 +51,7 @@ from subconscious.runtime.config import (
     BG_MODEL_EXECUTOR,
     BG_MODEL_PLANNER,
     BG_MODEL_REFLECTOR,
+    BG_MODEL_ASSESSOR,
     BG_MODEL_THINK,  # noqa: F401 - declared for PR D
     BG_MAX_ATTEMPTS_PER_GOAL,
     BG_MAX_OPEN_GOALS,
@@ -62,6 +63,8 @@ from subconscious.runtime.config import (
     BG_RECENT_OBSERVATIONS_LIMIT,
     BG_EXPLORATORY_PER_DAY,
     BG_PHASE_TIMEOUT,
+    BG_PHASE_TIMEOUT_ASSESSOR,
+    BG_ASSESS_ENABLED,
     BG_PHASE_TIMEOUT_EXECUTOR,
     BG_PHASE_TIMEOUT_EXPLORATORY,
     BG_TICK_TIMEOUT,
@@ -74,6 +77,7 @@ from subconscious.runtime.config import (
     BG_PROMPT_EXECUTOR,
     BG_PROMPT_EXPLORATORY,
     BG_PROMPT_REFLECTOR,
+    BG_PROMPT_ASSESSOR,
 )
 from subconscious.tools import registry
 from subconscious.tools import internal as internal_tools
@@ -200,11 +204,32 @@ Return ONLY a JSON object, no prose:
 - "keep_blocked" - leave it blocked; try again next tick.
 """
 
+_DEFAULT_ASSESSOR_INSTRUCTIONS = """\
+You are the assessor of a background worker. Decide whether a goal
+that the executor marked "done" was actually completed.
+
+Return ONLY a JSON object, no prose:
+
+  {"verdict": "verified" | "regressed" | "unclear",
+   "reason": "one short paragraph",
+   "evidence": "quote or reference from last_result"}
+
+- "verified"  - the claim cites specific facts, tool results, or
+                 checks consistent with the goal.
+- "regressed" - the claim is vague, the goal requires work the
+                 executor cannot do, or the claim contradicts itself.
+- "unclear"   - cannot decide from here (live state needed).
+
+Prefer "unclear" over "regressed" when the claim is plausible but
+unverifiable from the prompt.
+"""
+
 # Resolved prompts: file/env override wins, code default is the fallback.
 _PLANNER_INSTRUCTIONS = BG_PROMPT_PLANNER or _DEFAULT_PLANNER_INSTRUCTIONS
 _EXECUTOR_JSON_INSTRUCTIONS = BG_PROMPT_EXECUTOR or _DEFAULT_EXECUTOR_INSTRUCTIONS
 _EXPLORATORY_INSTRUCTIONS = BG_PROMPT_EXPLORATORY or _DEFAULT_EXPLORATORY_INSTRUCTIONS
 _REFLECTOR_INSTRUCTIONS = BG_PROMPT_REFLECTOR or _DEFAULT_REFLECTOR_INSTRUCTIONS
+_ASSESSOR_INSTRUCTIONS = BG_PROMPT_ASSESSOR or _DEFAULT_ASSESSOR_INSTRUCTIONS
 
 _EXPLORATORY_SEED_PREFERENCE = [
     # external signals first - actual changes in the environment
@@ -974,6 +999,105 @@ def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
             "degraded": degrade_reason}
 
 
+# ── Assessor (PR D) ──────────────────────────────────────────────────────────
+
+def _assessor(goal: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate whether a "done" goal was actually accomplished.
+
+    Returns {verdict, reason, evidence, model, tokens, degraded}. The
+    verdict is always one of "verified" | "regressed" | "unclear".
+    On any failure (LLM error, empty content, unparseable JSON) the
+    verdict is "unclear" with the error captured in reason; the caller
+    still records it in history, so a failure is visible in the ledger
+    rather than silently absent.
+
+    Model resolution: BG_MODEL_ASSESSOR -> BG_MODEL_REFLECTOR ->
+    BG_MODEL. Cloud budget degrade applies as for other phases.
+    """
+    model = BG_MODEL_ASSESSOR or BG_MODEL_REFLECTOR or BG_MODEL
+    model, degrade_reason = ledger.resolve_model(model, "assessor")
+
+    history_lines = []
+    for h in (goal.get("history") or [])[-5:]:
+        history_lines.append(
+            f"- {h.get('ts','?')} {h.get('event','?')} "
+            f"{h.get('by','')} {h.get('note','')}".rstrip()
+        )
+    history = "\n".join(history_lines) or "(empty)"
+
+    user_text = (
+        f"Goal: {goal.get('title') or '(untitled)'}\n"
+        f"Executor's claim (last_result): "
+        f"{goal.get('last_result') or '(none)'}\n"
+        f"Attempts: {goal.get('attempts', 0)}\n"
+        f"Partials: {goal.get('partials', 0)}\n"
+        f"Recent history:\n{history}\n\n"
+        f"Return your JSON verdict."
+    )
+
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": _ASSESSOR_INSTRUCTIONS},
+        {"role": "user", "content": user_text},
+    ]
+
+    try:
+        resp = _llm_call(messages, model, tools=None,
+                         num_predict=BG_NUM_PREDICT)
+    except Exception as e:
+        log.warning("[bg assessor] call failed: %s", e)
+        return {
+            "verdict": "unclear",
+            "reason": f"assessor error: {e}",
+            "evidence": "",
+            "model": model,
+            "tokens": 0,
+            "degraded": degrade_reason,
+        }
+
+    text = resp["content"] or ""
+    if not text.strip():
+        t = resp.get("thinking") or ""
+        if t.strip():
+            text = t
+
+    parsed = _extract_json(text) or {}
+    v = parsed.get("verdict")
+    if v not in ("verified", "regressed", "unclear"):
+        v = "unclear"
+
+    return {
+        "verdict": v,
+        "reason": parsed.get("reason", "") or "",
+        "evidence": parsed.get("evidence", "") or "",
+        "model": model,
+        "tokens": resp["tokens"],
+        "degraded": degrade_reason,
+    }
+
+
+def _record_assess_verdict(
+    g: Dict[str, Any], result: Dict[str, Any]
+) -> None:
+    """Write assessor output into the goal's in-memory state.
+
+    D2 policy: sets assessed/assess_verdict/assessed_at and appends a
+    history entry. Does NOT change status - a regressed verdict here
+    does not return the goal to pending; that is D3. The goal will be
+    archived by write_goals as usual, so the verdict survives in the
+    archive alongside the executor's claim.
+    """
+    now = ledger.now_iso()
+    g["assessed"] = True
+    g["assessed_at"] = now
+    g["assess_verdict"] = result["verdict"]
+    g.setdefault("history", []).append({
+        "ts": now,
+        "event": f"assessed={result['verdict']}",
+        "by": "assessor",
+        "note": (result.get("reason") or "")[:500],
+    })
+
+
 # ── ledger update helpers ─────────────────────────────────────────────────────
 
 def _apply_goal_update(g: Dict[str, Any], status: str, last_result: Optional[str]) -> None:
@@ -1297,6 +1421,62 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             if picked_goal["kind"] == "exploratory" and executor_result.get("title"):
                 g["title"] = executor_result["title"]
             _apply_goal_update(g, "done", executor_result["observation"])
+
+            # Assessor (PR D, D2 scaffold): evaluate the "done" claim.
+            # Writes verdict into g, does NOT change status. Bounded by
+            # its own timeout; on failure the verdict is "unclear" and
+            # is still recorded - a silent skip would hide the issue.
+            if BG_ASSESS_ENABLED and picked_goal["kind"] == "normal":
+                remaining_for_assess = int(max(
+                    30, tick_deadline - time.time()
+                ))
+                if remaining_for_assess > 0:
+                    try:
+                        assess_result = _run_with_timeout(
+                            _assessor,
+                            min(remaining_for_assess,
+                                BG_PHASE_TIMEOUT_ASSESSOR),
+                            g,
+                        )
+                    except TimeoutError as e:
+                        log.warning(
+                            "[bg %s] assessor timeout: %s", req_id, e,
+                        )
+                        assess_result = {
+                            "verdict": "unclear",
+                            "reason": f"timeout: {e}",
+                            "evidence": "",
+                            "model": "(timeout)",
+                            "tokens": 0,
+                            "degraded": None,
+                        }
+                    except Exception as e:
+                        log.warning(
+                            "[bg %s] assessor failed: %s", req_id, e,
+                        )
+                        assess_result = {
+                            "verdict": "unclear",
+                            "reason": f"error: {e}",
+                            "evidence": "",
+                            "model": "(error)",
+                            "tokens": 0,
+                            "degraded": None,
+                        }
+
+                    _record_assess_verdict(g, assess_result)
+                    tokens_used += int(assess_result.get("tokens", 0) or 0)
+                    ledger.append_journal({
+                        "req_id": req_id,
+                        "ts": ledger.now_iso(),
+                        "phase": "assessor",
+                        "model": assess_result["model"],
+                        "degraded": assess_result.get("degraded"),
+                        "verdict": assess_result["verdict"],
+                        "reason": (
+                            assess_result.get("reason") or ""
+                        )[:300],
+                        "tokens": assess_result["tokens"],
+                    })
 
         open_count = len(ledger.open_goals(goals["goals"]))
         added = 0
