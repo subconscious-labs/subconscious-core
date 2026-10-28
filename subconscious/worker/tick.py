@@ -94,6 +94,12 @@ _READONLY_SUFFIXES = (
     "_timeline", "_wake_up", "_stats", "_read", "_wings",
     "_rooms", "_taxonomy", "_peers", "_tunnels", "_hallways",
     "_drawer", "_drawers", "_duplicate", "_away", "_settings",
+    # meta_* proxy tools. _servers covers meta_list_servers, which is
+    # the only no-arg read-only tool visible when mempalace is behind
+    # lazy-mcp. Without it the exploratory seed rotation has no
+    # candidates and every exploratory tick fails with
+    # "no no-arg tools available".
+    "_servers",
 )
 
 _DEFAULT_PLANNER_INSTRUCTIONS = """\
