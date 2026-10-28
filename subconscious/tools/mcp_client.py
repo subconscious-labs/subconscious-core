@@ -204,6 +204,12 @@ class MCPClient:
         self._shutdown_event = threading.Event()
         self._connection_ready = threading.Event()
         self._disconnect_event = threading.Event()
+        # Incremented every time _run_session establishes a fresh
+        # connection. _wait_for_reconnect compares the pre-disconnect
+        # generation against the current one, so a retry after
+        # disconnect does not slip through on the old (still-present)
+        # session object.
+        self._session_generation: int = 0
 
     async def _on_notification(self, message):
         """Handle server-initiated JSON-RPC notifications."""
@@ -326,6 +332,11 @@ class MCPClient:
                         log.warning("[mcp] %s: pid capture failed: %s", self.name, e)
                         self._pid = None
 
+                # Fresh session established. Bump the generation
+                # before signalling ready - a reader in _wait_for_reconnect
+                # that grabbed the old generation must see the change.
+                self._session_generation += 1
+                self._disconnect_event.clear()
                 self._connection_ready.set()
 
                 # HTTP transports have native keep-alive and error handling
@@ -640,16 +651,44 @@ class MCPClient:
         finally:
             self._op_lock.release()
 
-    def _wait_for_reconnect(self, timeout: float = 10.0) -> bool:
-        """Wait until the connection loop has re-established a session.
+    def _wait_for_reconnect(
+        self, timeout: float = 10.0, generation_before: Optional[int] = None,
+    ) -> bool:
+        """Wait until the connection loop has established a NEW session.
 
-        Returns True if a live session is available before timeout;
-        False otherwise. Clears _disconnect_event on success so the
-        next call does not immediately try to reconnect again.
+        A retry after a disconnect cannot trust "self._session is not
+        None and _connection_ready is set" alone - those were already
+        true before the disconnect, because _run_session only tears them
+        down on its way out, and there is a window where the old session
+        object is still present after _disconnect_event is set.
+
+        Instead, compare the current session generation with the value
+        observed before the failed call. Returns True only when a session
+        with a strictly newer generation exists.
+
+        If generation_before is None (called without a prior observation),
+        fall back to the simple readiness check - useful for tests and
+        callers that do not have a pre-disconnect snapshot.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self._session is not None and self._connection_ready.is_set():
+            session_ready = (
+                self._session is not None
+                and self._connection_ready.is_set()
+            )
+            if generation_before is None:
+                # Caller did not snapshot the generation before the
+                # disconnect (e.g. tests, or a fresh caller that has
+                # nothing to compare against). Fall back to the plain
+                # readiness check - same contract as before the
+                # generation counter existed.
+                ready = session_ready
+            else:
+                # Strictly newer session required. A caller that took
+                # a snapshot before the failed call must not retry
+                # against a stale object still present in _session.
+                ready = session_ready and self._session_generation > generation_before
+            if ready:
                 self._disconnect_event.clear()
                 return True
             time.sleep(0.2)
@@ -680,11 +719,20 @@ class MCPClient:
             # but a real problem.
             if not self._disconnect_event.is_set():
                 raise
+            # Snapshot the generation BEFORE waiting - _run_session
+            # will bump it on the next successful connect. Waiting on
+            # "no strict increase" prevents retry against the old
+            # session object that is still present after disconnect.
+            gen_before = self._session_generation
             log.info(
-                "[mcp] %s: call_tool %r failed (%s), waiting for reconnect",
-                self.name, name, exc,
+                "[mcp] %s: call_tool %r failed (%s), waiting for reconnect "
+                "(generation %d)",
+                self.name, name, exc, gen_before,
             )
-            if not self._wait_for_reconnect(timeout=MCP_RECONNECT_WAIT_SEC):
+            if not self._wait_for_reconnect(
+                timeout=MCP_RECONNECT_WAIT_SEC,
+                generation_before=gen_before,
+            ):
                 log.warning(
                     "[mcp] %s: reconnect did not complete within %.0fs",
                     self.name, MCP_RECONNECT_WAIT_SEC,

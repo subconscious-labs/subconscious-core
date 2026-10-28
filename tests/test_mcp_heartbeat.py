@@ -106,7 +106,7 @@ def test_call_tool_retries_after_disconnect(client, monkeypatch):
             raise RuntimeError("Session terminated")
         return _fake_result("recovered")
 
-    def fake_reconnect(timeout):
+    def fake_reconnect(timeout, generation_before=None):
         # Connection comes back immediately; clear flag as real
         # _wait_for_reconnect would after finding a live session.
         client._disconnect_event.clear()
@@ -154,7 +154,8 @@ def test_call_tool_propagates_second_failure(client, monkeypatch):
 
     monkeypatch.setattr(client, "_run", fake_run)
     monkeypatch.setattr(
-        client, "_wait_for_reconnect", lambda timeout: True,
+        client, "_wait_for_reconnect",
+        lambda timeout, generation_before=None: True,
     )
 
     with pytest.raises(RuntimeError, match="fail #2"):
@@ -177,10 +178,86 @@ def test_call_tool_propagates_when_reconnect_fails(client, monkeypatch):
 
     monkeypatch.setattr(client, "_run", fake_run)
     monkeypatch.setattr(
-        client, "_wait_for_reconnect", lambda timeout: False,
+        client, "_wait_for_reconnect",
+        lambda timeout, generation_before=None: False,
     )
 
     with pytest.raises(RuntimeError, match="Session terminated"):
         client._call_tool_inner("x", {})
 
     assert calls["count"] == 1
+
+# ── generation-based reconnect wait ────────────────────────────────────────
+
+def test_wait_for_reconnect_rejects_old_generation(client):
+    """Old session object present + connection_ready set is not enough."""
+    client._session = MagicMock()  # old session still in memory
+    client._connection_ready.set()
+    client._disconnect_event.set()
+    client._session_generation = 5
+
+    # Ask to wait for generation > 5. With no new connect, must time out.
+    start = time.time()
+    ok = client._wait_for_reconnect(timeout=0.3, generation_before=5)
+    elapsed = time.time() - start
+
+    assert ok is False
+    assert 0.2 <= elapsed < 1.0
+    assert client._disconnect_event.is_set()  # not cleared
+
+
+def test_wait_for_reconnect_accepts_new_generation(client):
+    """After generation bumps, wait returns and clears disconnect flag."""
+    client._session = MagicMock()
+    client._connection_ready.set()
+    client._disconnect_event.set()
+    client._session_generation = 5
+
+    def bump():
+        time.sleep(0.15)
+        client._session_generation = 6
+
+    t = threading.Thread(target=bump, daemon=True)
+    t.start()
+
+    ok = client._wait_for_reconnect(timeout=1.0, generation_before=5)
+
+    assert ok is True
+    assert client._disconnect_event.is_set() is False
+
+
+def test_call_tool_retries_after_real_generation_bump(client, monkeypatch):
+    """End-to-end: first call fails, generation bumps, retry succeeds.
+
+    Reproduces the 12:56 race: old session present, connection_ready
+    still set, generation unchanged. Retry must NOT proceed against
+    the old session.
+    """
+    client._session = MagicMock()
+    client._connection_ready.set()
+    client._disconnect_event.set()
+    client._session_generation = 3
+
+    calls = {"count": 0}
+
+    def fake_run(coro, timeout):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("Session terminated")
+        return _fake_result("recovered")
+
+    def fake_wait(timeout, generation_before=None):
+        # Simulate the loop completing a reconnect.
+        client._session_generation += 1
+        client._disconnect_event.clear()
+        return True
+
+    monkeypatch.setattr(client, "_run", fake_run)
+    monkeypatch.setattr(client, "_wait_for_reconnect", fake_wait)
+
+    result = client._call_tool_inner("meta_search", {"query": "x"})
+
+    assert result == "recovered"
+    assert calls["count"] == 2
+    # generation advanced from 3 to 4
+    assert client._session_generation == 4
