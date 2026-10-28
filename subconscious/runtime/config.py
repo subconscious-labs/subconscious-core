@@ -86,6 +86,16 @@ MCP_RECONNECT_MAX_BACKOFF_SEC: float = float(
     _env("MCP_RECONNECT_MAX_BACKOFF_SEC", "300")
 )
 
+# How long to wait per MCP server during startup before returning
+# control to the caller. The reconnect loop continues in the
+# background either way; a short wait lets us pick up tools from
+# servers that are already up without blocking agent start on a
+# server that is down. Local http MCP servers respond in tens of
+# milliseconds; 1s covers cold-start and leaves plenty of room.
+MCP_INITIAL_WAIT_SEC: float = float(
+    _env("MCP_INITIAL_WAIT_SEC", "1")
+)
+
 # ── Tool rounds ───────────────────────────────────────────────────────────────
 MAX_TOOL_ROUNDS: int = int(_env("MAX_TOOL_ROUNDS", "5"))
 

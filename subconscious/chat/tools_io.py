@@ -46,6 +46,19 @@ def load_tools():
     registry = {}
     clients  = []
 
+    # Internal tools first. They are in-process, need no network, and
+    # make chat usable even if every MCP server is down. Registering
+    # them before any MCP discovery keeps startup fast: agent boot
+    # does not wait on MCP handshakes.
+    for schema in internal_tools.get_schemas():
+        fn = schema.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        tools.append(schema)
+        registry[name] = None      # marker: not an MCP client
+        log.debug("[tools] registered internal: %s", name)
+
     def _mcp_event_cb(server_name: str, params: dict):
         """Normalise an inbound MCP notification into process_event() inputs.
 
@@ -84,12 +97,16 @@ def load_tools():
             user_id=payload.get("user_id") if isinstance(payload, dict) else None,
         )
 
+    from subconscious.runtime.config import MCP_INITIAL_WAIT_SEC
+
     for server_name, cfg in discover_mcp_servers().items():
         client = MCPClient(cfg, name=server_name, on_event=_mcp_event_cb)
-        ready = client.start()
-        # Always register the client: atexit needs it for cleanup,
-        # mcp_server_restart needs it to find the client when the
-        # backend comes up later.
+        # Short wait: pick up tools from servers that are already up,
+        # skip immediately if not. Reconnect loop continues in the
+        # background regardless. Full timeout only on explicit
+        # mcp_server_restart, where the operator is waiting for an
+        # answer and a longer wait is expected.
+        ready = client.start(wait_timeout=MCP_INITIAL_WAIT_SEC)
         clients.append(client)
 
         if not ready:
@@ -138,15 +155,6 @@ def load_tools():
                 },
             })
             log.debug("[tools] registered: %s", name)
-
-    for schema in internal_tools.get_schemas():
-        fn = schema.get("function") or {}
-        name = fn.get("name")
-        if not name:
-            continue
-        tools.append(schema)
-        registry[name] = None      # marker: not an MCP client
-        log.debug("[tools] registered internal: %s", name)
 
     return tools, registry, clients
 
