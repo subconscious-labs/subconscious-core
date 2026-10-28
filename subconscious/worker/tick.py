@@ -1305,7 +1305,13 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 log.info("[bg %s] dropping extra new_goals (cap reached)",
                          req_id)
                 break
-            goals["goals"].append(ledger.new_goal(title, kind="normal"))
+            goals["goals"].append(
+                ledger.new_goal(
+                    title,
+                    kind="normal",
+                    parent_goal_id=picked_goal["id"],
+                )
+            )
             added += 1
 
         ledger.write_goals(goals)

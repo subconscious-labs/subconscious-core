@@ -351,9 +351,13 @@ def exploratory_min_interval_ok(goals: List[Dict[str, Any]]) -> bool:
     return elapsed_min >= BG_EXPLORATORY_MIN_INTERVAL_MIN
 
 
-def new_goal(title: str, kind: str) -> Dict[str, Any]:
+def new_goal(
+    title: str,
+    kind: str,
+    parent_goal_id: Optional[str] = None,
+) -> Dict[str, Any]:
     now = now_iso()
-    return {
+    goal: Dict[str, Any] = {
         "id": new_id(),
         "kind": kind,
         "title": title.strip()[:300] or "(untitled)",
@@ -364,6 +368,41 @@ def new_goal(title: str, kind: str) -> Dict[str, Any]:
         "last_result": None,
         "history": [{"ts": now, "event": "created", "by": "system"}],
     }
+    if parent_goal_id:
+        goal["parent_goal_id"] = parent_goal_id
+    return goal
+
+
+def find_descendants(
+    goals: List[Dict[str, Any]], root_id: str,
+) -> List[Dict[str, Any]]:
+    """Return all goals transitively descended from root_id.
+
+    Breadth-first walk via parent_goal_id links. Does not include the
+    root itself. The seen-set guards against accidental cycles in a
+    corrupted ledger - by construction a goal's parent exists when the
+    child is created, so a cycle should be impossible, but a defensive
+    check costs nothing.
+    """
+    by_parent: Dict[str, List[Dict[str, Any]]] = {}
+    for g in goals:
+        pid = g.get("parent_goal_id")
+        if pid:
+            by_parent.setdefault(pid, []).append(g)
+
+    result: List[Dict[str, Any]] = []
+    seen: set = {root_id}
+    queue = [root_id]
+    while queue:
+        current = queue.pop(0)
+        for child in by_parent.get(current, []):
+            cid = child.get("id")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            result.append(child)
+            queue.append(cid)
+    return result
 
 
 def find_goal(goals: List[Dict[str, Any]], goal_id: str) -> Optional[Dict[str, Any]]:

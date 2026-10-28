@@ -123,24 +123,35 @@ _SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "subcortex_goals_cancel",
             "description": (
-                "Cancel a goal that is no longer relevant. Writes a reason "
-                "into the goal's history and moves it to cancelled."
+                "Cancel a goal that is no longer relevant. Writes a "
+                "reason into the goal's history and moves it to "
+                "cancelled. With cascade=true, also cancels every goal "
+                "descended from any of the target ids via parent_goal_id "
+                "- useful when a parent goal was found to be a dead end "
+                "and its sub-goals exist only to unblock it."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "goal_id": {
                         "type": "string",
-                        "description": "Single goal id (legacy)."
+                        "description": "Single goal id (legacy).",
                     },
                     "goal_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Multiple goal ids to cancel at once."
+                        "description": "Multiple goal ids to cancel at once.",
                     },
                     "reason": {
                         "type": "string",
                         "description": "Why cancelled. Goes into history.",
+                    },
+                    "cascade": {
+                        "type": "boolean",
+                        "description": (
+                            "Also cancel all descendants of any target "
+                            "id via parent_goal_id. Default false."
+                        ),
                     },
                 },
             },
@@ -332,14 +343,16 @@ def _compact_goal(g: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(lr, str) and len(lr) > 300:
         lr = lr[:300] + "…"
     return {
-        "id":          g.get("id"),
-        "kind":        g.get("kind"),
-        "status":      g.get("status"),
-        "attempts":    g.get("attempts", 0),
-        "title":       g.get("title"),
-        "created_at":  g.get("created_at"),
-        "updated_at":  g.get("updated_at"),
-        "last_result": lr,
+        "id":              g.get("id"),
+        "kind":            g.get("kind"),
+        "status":          g.get("status"),
+        "attempts":        g.get("attempts", 0),
+        "partials":        g.get("partials", 0),
+        "title":           g.get("title"),
+        "created_at":      g.get("created_at"),
+        "updated_at":      g.get("updated_at"),
+        "last_result":     lr,
+        "parent_goal_id":  g.get("parent_goal_id"),
     }
 
 
@@ -489,6 +502,7 @@ def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "goal_id or goal_ids required"}
 
     reason = (args.get("reason") or "").strip()
+    cascade = bool(args.get("cascade", False))
 
     lock = _acquire_ledger_lock()
     if lock is None:
@@ -500,10 +514,28 @@ def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
         not_found: List[str] = []
         already_closed: List[Dict[str, str]] = []
 
+        # Phase 1: resolve the set to cancel (targets + descendants).
+        # Order preserved so history reads top-down. A descendant that
+        # is also listed explicitly in ids appears only once.
+        resolved: List[str] = []
+        explicit = set(ids)
         for gid in ids:
             target = ledger.find_goal(goals.get("goals", []), gid)
             if target is None:
                 not_found.append(gid)
+                continue
+            if gid not in resolved:
+                resolved.append(gid)
+            if cascade:
+                for d in ledger.find_descendants(goals.get("goals", []), gid):
+                    did = d.get("id")
+                    if did and did not in resolved:
+                        resolved.append(did)
+
+        # Phase 2: apply cancel.
+        for gid in resolved:
+            target = ledger.find_goal(goals.get("goals", []), gid)
+            if target is None:
                 continue
             if target.get("status") in ("done", "cancelled"):
                 already_closed.append({
@@ -512,11 +544,14 @@ def _cancel_goal(args: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             target["status"] = "cancelled"
             target["updated_at"] = now
+            note = reason or "(no reason given)"
+            if cascade and gid not in explicit:
+                note = f"{note} (cascade)"
             target.setdefault("history", []).append({
                 "ts":    now,
                 "event": "cancelled",
                 "by":    "user",
-                "note":  reason or "(no reason given)",
+                "note":  note,
             })
             cancelled.append(_compact_goal(target))
 

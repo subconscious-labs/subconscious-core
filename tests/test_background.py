@@ -11,11 +11,37 @@ import pytest
 
 @pytest.fixture()
 def bg(tmp_path, monkeypatch):
-    """Import worker.tick with isolated state dir."""
+    """Import worker.tick with isolated state dir.
+
+    Clears subconscious.worker and subconscious.runtime.config so each
+    test gets a fresh ledger bound to a fresh BG_STATE_DIR.
+
+    subconscious.tools.internal is cleared too, because it holds
+    `from subconscious.worker import ledger` at module level - the
+    captured reference would otherwise stay bound to a previous test's
+    directory. Only that one submodule is targeted, not the whole
+    subconscious.tools package: chat.prompt and chat.stream hold
+    module-level references to subconscious.tools.registry, and
+    reloading registry would leave those references dangling (a
+    monkeypatched list_tools in another test would land on the fresh
+    module while callers kept reading the old one).
+
+    Clearing sys.modules alone is not enough - the submodule attribute
+    stays on the parent package, and `from subconscious.tools import
+    internal` prefers the attribute over sys.modules. delattr forces a
+    real re-import.
+    """
     monkeypatch.setenv("SUBCONSCIOUS_BG_STATE_DIR", str(tmp_path / "bg"))
     for mod in list(sys.modules):
-        if mod == "subconscious.runtime.config" or mod.startswith("subconscious.worker"):
+        if (
+            mod == "subconscious.runtime.config"
+            or mod.startswith("subconscious.worker")
+            or mod == "subconscious.tools.internal"
+        ):
             del sys.modules[mod]
+    import subconscious.tools
+    if hasattr(subconscious.tools, "internal"):
+        delattr(subconscious.tools, "internal")
     from subconscious.worker import tick
     return tick
 
@@ -62,7 +88,6 @@ def test_create_goal_via_internal(lgr, tmp_path):
     )
     assert "created" in result
     assert result["created"]["title"] == "test goal"
-
 
 
 def test_find_goal(lgr):
@@ -133,3 +158,49 @@ def test_exploratory_tool_calls_default_zero(bg):
     """The tool_calls key must exist in executor output."""
     src = inspect.getsource(bg._executor)
     assert '"tool_calls": tool_calls_made' in src
+
+
+def test_cancel_cascade(lgr, bg):
+    from subconscious.tools import internal
+
+    g1 = lgr.new_goal("parent", kind="normal")
+    g2 = lgr.new_goal("child1", kind="normal", parent_goal_id=g1["id"])
+    g3 = lgr.new_goal("child2", kind="normal", parent_goal_id=g1["id"])
+    goals = {
+        "version": lgr.GOALS_VERSION,
+        "goals": [g1, g2, g3],
+        "updated_at": lgr.now_iso(),
+    }
+    lgr.atomic_write_json(lgr.goals_path(), goals)
+
+    result = internal.call_internal(
+        "subcortex_goals_cancel",
+        {"goal_id": g1["id"], "reason": "test", "cascade": True},
+    )
+    assert result["cancelled_count"] == 3
+
+    reloaded = lgr.read_goals()
+    assert reloaded["goals"] == []
+
+
+def test_cancel_no_cascade(lgr, bg):
+    from subconscious.tools import internal
+
+    g1 = lgr.new_goal("parent", kind="normal")
+    g2 = lgr.new_goal("child1", kind="normal", parent_goal_id=g1["id"])
+    goals = {
+        "version": lgr.GOALS_VERSION,
+        "goals": [g1, g2],
+        "updated_at": lgr.now_iso(),
+    }
+    lgr.atomic_write_json(lgr.goals_path(), goals)
+
+    result = internal.call_internal(
+        "subcortex_goals_cancel",
+        {"goal_id": g1["id"], "reason": "test", "cascade": False},
+    )
+    assert result["cancelled_count"] == 1
+
+    reloaded = lgr.read_goals()
+    assert len(reloaded["goals"]) == 1
+    assert reloaded["goals"][0]["id"] == g2["id"]
