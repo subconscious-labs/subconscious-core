@@ -19,8 +19,9 @@ assembled from local identity.txt plus a KG snippet fetched over MCP.
 import functools
 import logging
 import os
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from subconscious.runtime.config import (
     MEMPALACE_PALACE_PATH,
@@ -75,6 +76,50 @@ def _read_identity() -> str:
 # ── KG snippet via MCP ────────────────────────────────────────────────────────
 
 def _kg_snippet_via_mcp(limit: int = MEMORY_KG_SNIPPET_LIMIT) -> str:
+    """Fetch a KG snippet, but never block wake-up on a slow proxy.
+
+    meta_call through lazy-mcp occasionally takes >60s for kg_timeline
+    (lazy-mcp cold start, mempalace GC, or a hung proxy connection).
+    60s in the request path means every first event after a restart
+    loses KG. Bound it: KG_SNIPPET_TIMEOUT (default 10s) is enough for
+    a normal answer; a timeout just means "wake up with identity only",
+    which is the pre-KG behaviour, not a new failure.
+    """
+    box: Dict[str, Any] = {"result": "", "elapsed": 0.0}
+
+    def runner() -> None:
+        import time as _t
+        t0 = _t.time()
+        try:
+            box["result"] = _kg_snippet_fetch(limit)
+        except Exception as e:
+            log.warning("KG snippet fetch raised: %s", e)
+        box["elapsed"] = _t.time() - t0
+
+    t = threading.Thread(target=runner, daemon=True, name="kg-fetch")
+    t.start()
+    t.join(timeout=KG_SNIPPET_TIMEOUT)
+    if t.is_alive():
+        log.warning(
+            "KG snippet fetch timed out after %.0fs - "
+            "wake-up will use identity only",
+            KG_SNIPPET_TIMEOUT,
+        )
+        return ""
+
+    text = box["result"] or ""
+    if text:
+        log.info(
+            "KG snippet fetched in %.1fs (%d chars)",
+            box["elapsed"], len(text),
+        )
+    return text
+
+
+def _kg_snippet_fetch(limit: int) -> str:
+    """Actual fetch. Runs in a daemon thread; bounded by the caller's
+    timeout. Splitting the logic keeps the timeout wrapper readable and
+    the fetch path testable in isolation."""
     try:
         from subconscious.tools import registry
     except Exception as e:
@@ -110,13 +155,13 @@ def _kg_snippet_via_mcp(limit: int = MEMORY_KG_SNIPPET_LIMIT) -> str:
         return ""
 
     lines = []
-    for t in timeline[:limit]:
-        s = t.get("subject") or "?"
-        p = t.get("predicate") or "?"
-        o = t.get("object") or "?"
-        if t.get("current", True):
+    for t_entry in timeline[:limit]:
+        s = t_entry.get("subject") or "?"
+        p = t_entry.get("predicate") or "?"
+        o = t_entry.get("object") or "?"
+        if t_entry.get("current", True):
             lines.append(f"{s} {p} {o}")
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 
 # ── wake-up assembly ──────────────────────────────────────────────────────────

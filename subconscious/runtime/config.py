@@ -124,6 +124,13 @@ MEMORY_KG_SNIPPET_LIMIT: int = int(
     _env("MEMORY_KG_SNIPPET_LIMIT", "60")
 )
 
+
+# Max seconds to spend fetching the KG snippet for wake-up. Beyond this
+# the wake-up proceeds with identity only (pre-KG behaviour). 60s is the
+# MCP client default and far too long for a request-scoped prefill step;
+# 10s covers the normal path on a healthy proxy.
+KG_SNIPPET_TIMEOUT: float = float(_env("KG_SNIPPET_TIMEOUT", "10"))
+
 # ── OpenRouter ────────────────────────────────────────────────────────────────
 OPENROUTER_API_MODELS: List[str] = [
     m.strip()
