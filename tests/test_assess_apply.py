@@ -217,3 +217,94 @@ def test_needs_review_not_archived_on_write(tick_mod):
     reloaded = ledger.read_goals()
     assert len(reloaded["goals"]) == 1
     assert reloaded["goals"][0]["status"] == "needs-review"
+
+
+# ── read_recent_regressed + planner context ───────────────────────────────
+
+def test_read_recent_regressed_from_archive(tick_mod):
+    tick, ledger = tick_mod
+    regressed = {
+        "id": "g-old", "kind": "normal", "status": "done",
+        "title": "Investigate flaky service X",
+        "assess_verdict": "regressed",
+        "last_result": "claimed done but was vague",
+        "created_at": ledger.now_iso(),
+        "updated_at": ledger.now_iso(),
+        "history": [],
+    }
+    ledger.append_archive(regressed)
+    # Non-regressed entry must be ignored.
+    ledger.append_archive({
+        "id": "g-ok", "kind": "normal", "status": "done",
+        "title": "Fine goal", "assess_verdict": "verified",
+        "created_at": ledger.now_iso(),
+        "updated_at": ledger.now_iso(),
+        "history": [],
+    })
+
+    results = ledger.read_recent_regressed(limit=3)
+    assert len(results) == 1
+    assert results[0]["id"] == "g-old"
+
+
+def test_read_recent_regressed_from_active(tick_mod):
+    tick, ledger = tick_mod
+    active = {
+        "id": "g-pending", "kind": "normal", "status": "pending",
+        "title": "In-flight goal",
+        "assess_verdict": "regressed",
+        "created_at": ledger.now_iso(),
+        "updated_at": ledger.now_iso(),
+        "history": [],
+    }
+    goals = {
+        "version": ledger.GOALS_VERSION,
+        "goals": [active],
+        "updated_at": ledger.now_iso(),
+    }
+    ledger.atomic_write_json(ledger.goals_path(), goals)
+
+    results = ledger.read_recent_regressed(limit=3)
+    assert len(results) == 1
+    assert results[0]["id"] == "g-pending"
+
+
+def test_planner_includes_recent_regressed(tick_mod, monkeypatch):
+    """Planner's user_text mentions regressed goal titles so the model
+    does not re-propose them."""
+    tick, ledger = tick_mod
+    ledger.append_archive({
+        "id": "g-old", "kind": "normal", "status": "done",
+        "title": "Investigate flaky service X",
+        "assess_verdict": "regressed",
+        "last_result": "claimed done, was vague",
+        "created_at": ledger.now_iso(),
+        "updated_at": ledger.now_iso(),
+        "history": [],
+    })
+
+    captured: dict = {}
+
+    def fake_llm(messages, model, tools=None, num_predict=None,
+                 response_format=None):
+        captured["messages"] = messages
+        return {
+            "content": '{"decision": "skip", "reason": "test"}',
+            "thinking": "",
+            "tool_calls": [],
+            "tokens": 0,
+            "raw": {},
+        }
+
+    monkeypatch.setattr(tick, "_llm_call", fake_llm)
+    monkeypatch.setattr(
+        ledger, "resolve_model", lambda m, phase: (m, None)
+    )
+
+    tick._planner()
+
+    user_msg = next(
+        m["content"] for m in captured["messages"] if m["role"] == "user"
+    )
+    assert "Investigate flaky service X" in user_msg
+    assert "do NOT re-propose" in user_msg

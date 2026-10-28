@@ -131,13 +131,7 @@ Bad "new" examples (do NOT do this):
 - "Verify backups work" (already covered by borgmatic observation)
 - "Monitor disk space" (not based on any observation)
 
-If you cannot point to a specific observation, return "skip".
-
-Observations are shown with their age. An observation older than a few
-hours describes a past state that may no longer hold. Do not create new
-goals based on stale observations: if the newest signal is old, prefer
-"skip" or pick an existing goal that already has fresh context. If you
-cannot point to a fresh observation, return "skip".
+If you cannot point to a fresh observation, return "skip".
 
 Goals are shown with both attempts (hard failures) and partials
 (progress without completion). A goal with partials >= 2 has already
@@ -146,6 +140,18 @@ over "pick" for such goals unless a FRESH observation specifically
 provides what the previous partial was missing (a tool that is now
 available, a value that was not there before, a different path that
 just opened up). "It might work this time" is not a reason to pick.
+
+Recently regressed goals are those the assessor judged as falsely
+"done" - the executor claimed completion, the assessor disagreed.
+Do NOT propose the same investigation as a new goal unless a fresh
+observation specifically provides new evidence that would change the
+outcome. "It might work this time" is not a reason.
+
+Observations are shown with their age. An observation older than a few
+hours describes a past state that may no longer hold. Do not create new
+goals based on stale observations: if the newest signal is old, prefer
+"skip" or pick an existing goal that already has fresh context. If you
+cannot point to a fresh observation, return "skip".
 """
 
 _DEFAULT_EXECUTOR_INSTRUCTIONS = """\
@@ -553,6 +559,21 @@ def _planner() -> Dict[str, Any]:
         f"- {g.get('title', '?')}" for g in recent_normal
     ) or "(none)"
 
+    # Recent assessor-regressed goals: false-done claims. Context so
+    # the planner does not re-propose the same investigation the
+    # assessor just rejected. Bounded to 3 entries; each title
+    # truncated, each reason snippet-capped.
+    regressed = ledger.read_recent_regressed(limit=3)
+    if regressed:
+        reg_lines = []
+        for r in regressed:
+            title = (r.get("title") or "?")[:120]
+            reason = (r.get("last_result") or "")[:150].replace("\n", " ")
+            reg_lines.append(f"- {title} (reason: {reason})")
+        regressed_block = "\n".join(reg_lines)
+    else:
+        regressed_block = "(none)"
+
     listing_lines = []
 
     for g in open_list:
@@ -565,6 +586,8 @@ def _planner() -> Dict[str, Any]:
     user_text = (
         f"Recent observations:\n{obs_block}\n\n"
         f"Recently created normal goals (do NOT duplicate these):\n{recent_titles}\n\n"
+        f"Recently regressed goals (assessor said 'done' was false - "
+        f"do NOT re-propose without new evidence):\n{regressed_block}\n\n"
         f"Open goals: {len(open_list)} / {cap}\n"
         f"{listing}\n\n"
         f"New normal goals created today: {made_today} / {BG_MAX_NEW_GOALS_PER_DAY}\n\n"
