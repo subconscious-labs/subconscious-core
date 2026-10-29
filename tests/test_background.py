@@ -204,3 +204,165 @@ def test_cancel_no_cascade(lgr, bg):
     reloaded = lgr.read_goals()
     assert len(reloaded["goals"]) == 1
     assert reloaded["goals"][0]["id"] == g2["id"]
+
+
+# ── Wave 1-2 fixes: partials reset, seed availability, hallucination ─────
+
+def test_reflector_retry_resets_partials(lgr):
+    """Item 10: reflector retry must clear partials alongside attempts.
+
+    Without this, a goal that accumulated partials=2 goes straight back
+    to blocked on the next attempt, before any new information can
+    change the outcome. Contract test: the state transition the code in
+    _tick_impl performs leaves both counters at zero.
+    """
+    g = lgr.new_goal("stuck goal", kind="normal")
+    g["attempts"] = 3
+    g["partials"] = 2
+    g["status"] = "blocked"
+    goals = {
+        "version": lgr.GOALS_VERSION,
+        "goals": [g],
+        "updated_at": lgr.now_iso(),
+    }
+    lgr.atomic_write_json(lgr.goals_path(), goals)
+
+    # Apply the retry transition that _tick_impl performs.
+    reloaded = lgr.read_goals()
+    g2 = lgr.find_goal(reloaded["goals"], g["id"])
+    g2["attempts"] = 0
+    g2["partials"] = 0
+    g2["status"] = "pending"
+    lgr.write_goals(reloaded)
+
+    result = lgr.read_goals()["goals"][0]
+    assert result["status"] == "pending"
+    assert result["attempts"] == 0
+    assert result["partials"] == 0
+
+
+def test_exploratory_seed_available_false_no_tools(bg, monkeypatch):
+    """Item 5: no tools at all -> no seed available."""
+    monkeypatch.setattr(bg, "_allowed_tools_for", lambda k: [])
+    assert bg._exploratory_seed_available() is False
+
+
+def test_exploratory_seed_available_true_with_no_arg_tool(bg, monkeypatch):
+    """Item 5: a no-arg tool is a valid seed."""
+    monkeypatch.setattr(bg, "_allowed_tools_for", lambda k: [{
+        "type": "function",
+        "function": {
+            "name": "meta_list_servers",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }])
+    assert bg._exploratory_seed_available() is True
+
+
+def test_exploratory_seed_available_false_all_require_args(bg, monkeypatch):
+    """Item 5: every tool needs args -> no usable seed."""
+    monkeypatch.setattr(bg, "_allowed_tools_for", lambda k: [
+        {
+            "type": "function",
+            "function": {
+                "name": "mempalace_search",
+                "parameters": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {"query": {"type": "string"}},
+                },
+            },
+        },
+    ])
+    assert bg._exploratory_seed_available() is False
+
+
+def test_hallucination_guard_prepends_note(bg, lgr, monkeypatch):
+    """Item 6: zero tool calls + claim in observation -> NOTE prepended.
+
+    Reproduces req 39e45070 (2026-10-28): model wrote 'single
+    meta_list_servers call returned empty payload' with tool_calls_made=0.
+    """
+    monkeypatch.setattr(lgr, "resolve_model", lambda m, p: (m, None))
+    monkeypatch.setattr(
+        bg, "_executor_tool_loop",
+        lambda msgs, model, tools, max_rounds: (100, 0),
+    )
+    monkeypatch.setattr(bg, "_allowed_tools_for", lambda k: [])
+    monkeypatch.setattr(bg, "_system_block", lambda p: "")
+
+    def fake_llm(messages, model, tools=None, num_predict=None,
+                 response_format=None):
+        return {
+            "content": (
+                '{"outcome": "done", "observation": '
+                '"I called meta_list_servers and got an empty payload"}'
+            ),
+            "thinking": "",
+            "tool_calls": [],
+            "tokens": 50,
+            "raw": {},
+        }
+
+    monkeypatch.setattr(bg, "_llm_call", fake_llm)
+
+    goal = {
+        "id": "g1", "kind": "normal", "title": "test",
+        "attempts": 0, "last_result": None, "history": [],
+    }
+    result = bg._executor(goal)
+
+    assert "no tools were called" in result["observation"]
+    # Claim preserved as context, not discarded.
+    assert "meta_list_servers" in result["observation"]
+
+
+def test_cancel_stale_normal_goals_ttl(lgr, monkeypatch):
+    """Item 3: normal pending goals older than TTL are cancelled; active,
+    done, cancelled, and exploratory are left alone."""
+    from datetime import datetime, timezone, timedelta
+
+    old = (datetime.now(timezone.utc) - timedelta(hours=30)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f"
+    ) + "000Z"
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f"
+    ) + "000Z"
+
+    goals = [
+        # Old pending normal -> cancelled.
+        {"id": "g-old", "kind": "normal", "status": "pending",
+         "updated_at": old, "history": []},
+        # Fresh pending normal -> kept.
+        {"id": "g-fresh", "kind": "normal", "status": "pending",
+         "updated_at": fresh, "history": []},
+        # Old but active -> kept (being worked on right now).
+        {"id": "g-active", "kind": "normal", "status": "active",
+         "updated_at": old, "history": []},
+        # Old pending exploratory -> kept (own TTL).
+        {"id": "g-expl", "kind": "exploratory", "status": "pending",
+         "updated_at": old, "history": []},
+        # Old but already done -> untouched.
+        {"id": "g-done", "kind": "normal", "status": "done",
+         "updated_at": old, "history": []},
+    ]
+
+    changed = lgr.cancel_stale_normal_goals(goals, ttl_hours=24)
+    assert changed == 1
+    assert goals[0]["status"] == "cancelled"
+    assert "stale" in goals[0]["history"][-1]["note"]
+    assert goals[1]["status"] == "pending"
+    assert goals[2]["status"] == "active"
+    assert goals[3]["status"] == "pending"
+    assert goals[4]["status"] == "done"
+
+
+def test_cancel_stale_normal_goals_disabled(lgr):
+    """ttl_hours <= 0 disables the check entirely."""
+    goals = [
+        {"id": "g-old", "kind": "normal", "status": "pending",
+         "updated_at": "2020-01-01T00:00:00.000000000Z", "history": []},
+    ]
+    assert lgr.cancel_stale_normal_goals(goals, ttl_hours=0) == 0
+    assert lgr.cancel_stale_normal_goals(goals, ttl_hours=-1) == 0
+    assert goals[0]["status"] == "pending"

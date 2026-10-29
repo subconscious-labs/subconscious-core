@@ -191,3 +191,61 @@ def test_record_preserves_existing_history(tick_mod):
     })
     assert g["history"][0] == prior
     assert len(g["history"]) == 2
+
+
+
+
+# ── system block integration (item 7) ────────────────────────────────────
+
+def test_assessor_uses_system_block(tick_mod, monkeypatch):
+    """Item 7: _assessor must consult _system_block("assessor") so
+    BG_WAKEUP_MODE_ASSESSOR works symmetrically with other phases."""
+    tick, _ = tick_mod
+    captured = {"messages": None}
+
+    def fake_llm(messages, model, tools=None, num_predict=None,
+                 response_format=None):
+        captured["messages"] = messages
+        return _normalised(
+            content='{"verdict": "verified", "reason": "ok"}',
+        )
+
+    monkeypatch.setattr(tick, "_llm_call", fake_llm)
+    monkeypatch.setattr(
+        tick, "_system_block", lambda phase: f"WAKEUP:{phase}"
+    )
+
+    tick._assessor({"id": "g1", "title": "t"})
+
+    # Wake-up is first.
+    assert captured["messages"][0] == {
+        "role": "system", "content": "WAKEUP:assessor"
+    }
+    # Instructions still present as a second system message.
+    assert any(
+        m["role"] == "system" and "assessor" in m["content"].lower()
+        for m in captured["messages"][1:]
+    )
+    # User text last.
+    assert captured["messages"][-1]["role"] == "user"
+
+
+def test_assessor_no_system_block_when_disabled(tick_mod, monkeypatch):
+    """With BG_WAKEUP_MODE=none, _system_block returns "" and the
+    assessor instructions become the first system message (old
+    behaviour)."""
+    tick, _ = tick_mod
+    captured = {"messages": None}
+
+    def fake_llm(messages, model, tools=None, num_predict=None,
+                 response_format=None):
+        captured["messages"] = messages
+        return _normalised(content='{"verdict": "verified"}')
+
+    monkeypatch.setattr(tick, "_llm_call", fake_llm)
+    monkeypatch.setattr(tick, "_system_block", lambda phase: "")
+
+    tick._assessor({"id": "g1", "title": "t"})
+
+    assert captured["messages"][0]["role"] == "system"
+    assert "WAKEUP" not in captured["messages"][0]["content"]

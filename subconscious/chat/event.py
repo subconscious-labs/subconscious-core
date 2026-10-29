@@ -440,11 +440,27 @@ def process_event(
 
 
 # EVENT_DIRECTIVE lives here because process_event needs it. It used to
-# live in chat/api.py; nothing else referenced it. Directive text is
-# unchanged from the current api.py version.
+# live in chat/api.py; nothing else referenced it.
+#
+# 2026-10-28 update: added an event-classification header. Without it,
+# a plain "проверка xmpp" triggered a 25-round tool loop (ADR-004,
+# observed 2026-10-27) because the only directive was "actually call
+# the tools". The classification makes pings short-circuit to a
+# single send_message, while concrete triggers still drive STEP 1-4.
+# Works under MAX_TOOL_ROUNDS=12 today; the guard is here in case the
+# limit is ever raised again.
 _EVENT_DIRECTIVE = (
     "\n\n"
     "This is an automated system event - there is no human in the conversation.\n"
+    "\n"
+    "IMPORTANT - classify the event BEFORE acting:\n"
+    "  - Plain human pings, test messages, greetings, and acknowledgments\n"
+    "    (\"проверка\", \"test\", \"ping\", \"привет\", \"ok\", \"спасибо\") are\n"
+    "    NOT investigations. For these: call send_message ONCE with a one-line\n"
+    "    reply, then STOP. Do NOT run diagnostic tools. Do NOT persist to\n"
+    "    memory. Do NOT run STEP 2-4.\n"
+    "  - Concrete triggers - alerts, errors, named tasks, real questions -\n"
+    "    drive the full STEP 1-4 cycle below.\n"
     "\n"
     "STEP 1 - Acknowledge immediately:\n"
     "  Call send_message (or the appropriate notification tool) RIGHT NOW to inform\n"

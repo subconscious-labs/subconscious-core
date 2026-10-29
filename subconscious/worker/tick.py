@@ -63,6 +63,7 @@ from subconscious.runtime.config import (
     BG_OBSERVATION_MAX_AGE_HOURS,
     BG_RECENT_OBSERVATIONS_LIMIT,
     BG_EXPLORATORY_PER_DAY,
+    BG_STALE_GOAL_TTL_HOURS,
     BG_PHASE_TIMEOUT,
     BG_PHASE_TIMEOUT_ASSESSOR,
     BG_ASSESS_ENABLED,
@@ -355,7 +356,7 @@ def _llm_call(
 def _system_block(phase: str) -> str:
     """Return the wake-up block appropriate for a phase.
 
-    phase is one of: "planner", "executor", "reflector", "exploratory".
+    phase is one of: "planner", "executor", "reflector", "exploratory", "assessor".
 
     Mode resolution:
       1. Per-phase override (BG_WAKEUP_MODE_<PHASE>) if non-empty.
@@ -371,6 +372,7 @@ def _system_block(phase: str) -> str:
         BG_WAKEUP_MODE_EXECUTOR,
         BG_WAKEUP_MODE_REFLECTOR,
         BG_WAKEUP_MODE_EXPLORATORY,
+        BG_WAKEUP_MODE_ASSESSOR,
     )
 
     per_phase = {
@@ -378,6 +380,7 @@ def _system_block(phase: str) -> str:
         "executor":    BG_WAKEUP_MODE_EXECUTOR,
         "reflector":   BG_WAKEUP_MODE_REFLECTOR,
         "exploratory": BG_WAKEUP_MODE_EXPLORATORY,
+        "assessor":    BG_WAKEUP_MODE_ASSESSOR,
     }
     mode = (per_phase.get(phase) or BG_WAKEUP_MODE or "none").lower()
 
@@ -700,6 +703,18 @@ def _tool_needs_args(tool: Dict[str, Any]) -> bool:
     return bool(required)
 
 
+def _exploratory_seed_available() -> bool:
+    """True if at least one no-arg read-only tool is available.
+
+    Pre-check used before creating or auto-resuming an exploratory goal.
+    Without a seed tool, the executor would fail immediately and leave
+    an empty goal in the ledger (observed 2026-10-28, g-dc064e). The
+    goal is not created unless a seed is actually callable.
+    """
+    tools = _allowed_tools_for("exploratory")
+    return any(not _tool_needs_args(t) for t in tools)
+
+
 def _pick_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Rotate through read-only tools that can be called with no arguments.
 
@@ -944,6 +959,19 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
     ) else "failed"
 
     observation = _observation_or_fallback(parsed, resp, model)
+
+    # Hallucination guard: model sometimes claims tool activity in
+    # `observation` when the tool loop actually made zero calls
+    # (observed 2026-10-28, req 39e45070). Never trust the claim in
+    # that case; prepend an explicit NOTE and keep the raw text as
+    # context.
+    if tool_calls_made == 0:
+        observation = (
+            "NOTE: no tools were called this attempt "
+            f"(tool_calls_made=0). Model's claim (unverified): "
+            f"{observation[:500] if observation else '(empty)'}"
+        )
+
     upd = parsed.get("goal_updates") or {}
     new_status = upd.get("status") if upd.get("status") in (
         "done", "partial", "blocked"
@@ -1065,10 +1093,12 @@ def _assessor(goal: Dict[str, Any]) -> Dict[str, Any]:
         f"Return your JSON verdict."
     )
 
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": _ASSESSOR_INSTRUCTIONS},
-        {"role": "user", "content": user_text},
-    ]
+    messages: List[Dict[str, Any]] = []
+    wakeup = _system_block("assessor")
+    if wakeup:
+        messages.append({"role": "system", "content": wakeup})
+    messages.append({"role": "system", "content": _ASSESSOR_INSTRUCTIONS})
+    messages.append({"role": "user", "content": user_text})
 
     try:
         resp = _llm_call(messages, model, tools=None,
@@ -1272,6 +1302,19 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         log.info("[bg %s] cancelled %d stale exploratory goal(s)",
                  req_id, cancelled)
 
+    # Ledger hygiene: TTL for normal pending goals. A goal the planner
+    # keeps skipping and no state transition touches is unreachable by
+    # any path; after BG_STALE_GOAL_TTL_HOURS we cancel it rather than
+    # let it sit forever in goals.json.
+    goals = ledger.read_goals()
+    stale = ledger.cancel_stale_normal_goals(
+        goals["goals"], BG_STALE_GOAL_TTL_HOURS,
+    )
+    if stale:
+        ledger.write_goals(goals)
+        log.info("[bg %s] cancelled %d stale normal goal(s)",
+                 req_id, stale)
+
     # ── Auto-resume pending exploratory before invoking the planner ────
     # If a previous exploratory tick timed out or failed, its goal is left
     # in `pending`. Do not spend time on the planner only for it to return
@@ -1283,6 +1326,33 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
 
     if existing_expl:
         picked_goal = existing_expl[0]
+        if not _exploratory_seed_available():
+            log.info(
+                "[bg %s] no seed tool available - cancelling exploratory %s",
+                req_id, picked_goal["id"],
+            )
+            goals = ledger.read_goals()
+            g = ledger.find_goal(goals["goals"], picked_goal["id"])
+            if g is not None:
+                g["status"] = "cancelled"
+                g["updated_at"] = ledger.now_iso()
+                g.setdefault("history", []).append({
+                    "ts": g["updated_at"],
+                    "event": "cancelled",
+                    "by": "system",
+                    "note": "no no-arg read-only tools available for seed",
+                })
+                ledger.write_goals(goals)
+            ledger.append_journal({
+                "req_id": req_id, "ts": ledger.now_iso(),
+                "status": "skipped",
+                "reason": "no_exploratory_seed_tools_on_resume",
+            })
+            return {
+                "req_id": req_id,
+                "status": "skipped",
+                "reason": "no_exploratory_seed_tools_on_resume",
+            }
         picked_goal["status"] = "active"
         picked_goal["updated_at"] = ledger.now_iso()
         picked_goal.setdefault("history", []).append({
@@ -1303,6 +1373,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         tokens_used = 0
         log.info("[bg %s] auto-resuming exploratory %s (attempts=%d)",
                  req_id, picked_goal["id"], picked_goal.get("attempts", 0))
+
     else:
         # Short-circuit: if there is nothing useful the planner could do,
         # do not spend 2.5 minutes on it. The planner can only act on
@@ -1428,6 +1499,25 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 "req_id": req_id,
                 "status": "skipped",
                 "reason": "exploratory_min_interval",
+            }
+        # Pre-check: no usable seed -> don't create the goal at all.
+        # Without this, a tick that fires while MCP tools are still
+        # loading leaves a placeholder goal in the ledger that fails
+        # on the next tick and then sits pending until TTL.
+        if not _exploratory_seed_available():
+            log.info(
+                "[bg %s] no seed tool available - skipping exploratory creation",
+                req_id,
+            )
+            ledger.append_journal({
+                "req_id": req_id, "ts": ledger.now_iso(),
+                "status": "skipped",
+                "reason": "no_exploratory_seed_tools",
+            })
+            return {
+                "req_id": req_id,
+                "status": "skipped",
+                "reason": "no_exploratory_seed_tools",
             }
         # Note: no need to check _active_exploratory here - if there was an
         # active one, we would have auto-resumed it above.
@@ -1617,6 +1707,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 now = ledger.now_iso()
                 if refl["decision"] == "retry":
                     g["attempts"] = 0
+                    g["partials"] = 0
                     g["status"] = "pending"
                 elif refl["decision"] == "cancel":
                     g["status"] = "cancelled"

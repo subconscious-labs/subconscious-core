@@ -15,4 +15,15 @@ When you are done, produce ONLY a JSON object, no prose:
   {"outcome": "done",
    "observation": "one short paragraph",
    "goal_updates": {"status": "done", "last_result": "..."},
-   "new_goals": []}
+   "new_goals": [],
+   "useful": true | false,
+   "useful_reason": "one short sentence"}
+
+"useful" = false if the observation is just a count, a status line, or
+structural metadata with no actionable content. "useful" = true if the
+observation surfaced something a human would act on or investigate.
+
+IMPORTANT: When you quote numbers in your observation, they MUST come
+directly from the tool result. Do not scale, extrapolate, round, or
+paraphrase numeric values. If the tool says "101 edges", write "101 edges",
+not "over 100" or "around 3200". If unsure of a number, do not mention it.

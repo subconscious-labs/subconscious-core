@@ -324,6 +324,16 @@ BG_EXPLORATORY_MIN_INTERVAL_MIN: int = int(
     _env("BG_EXPLORATORY_MIN_INTERVAL_MIN", "90")
 )
 
+# Normal goals that stay pending without any state change for this many
+# hours are auto-cancelled. Prevents the "goal sits forever because
+# planner won't pick it and no state transition can fire" case
+# (ADR-004, observed g-6e883d and g-98354f on 2026-10-27). TTL is
+# measured from updated_at, so any transition resets the clock.
+# 0 disables the TTL entirely.
+BG_STALE_GOAL_TTL_HOURS: float = float(
+    _env("BG_STALE_GOAL_TTL_HOURS", "24")
+)
+
 # Daily budget. 0 = no limit. Token counting relies on Ollama's
 # prompt_eval_count + eval_count; OpenAI-compatible backends currently do
 # not surface token usage through chatd, so their ticks count as 0.
@@ -426,8 +436,13 @@ CHAT_TOOL_RESULT_MAX_CHARS: int = int(
 def _load_bg_prompt(name: str) -> str:
     paths = [
         Path(__file__).resolve().parent.parent / "worker" / "prompts" / f"{name}.txt",
-        Path("/etc/chatd/prompts") / f"{name}.txt",
-        Path(os.path.expanduser("~/.config/chatd/prompts")) / f"{name}.txt",
+        Path("/var/lib/subconscious/prompts") / f"{name}.txt",
+        Path("/etc/subconscious/prompts") / f"{name}.txt",
+        Path(os.path.expanduser("~/.config/subconscious/prompts")) / f"{name}.txt",
+        # Shipped default: used on fresh install where deploy has not
+        # yet run `cp *.example *.txt`. Lowest-priority file source;
+        # /etc and ~/.config overrides still win over the default.
+        Path(__file__).resolve().parent.parent / "worker" / "prompts" / f"{name}.example",
     ]
     for p in paths:
         if p.exists():
@@ -476,7 +491,7 @@ BG_WAKEUP_MODE_PLANNER: str = _env("BG_WAKEUP_MODE_PLANNER", "")
 BG_WAKEUP_MODE_EXECUTOR: str = _env("BG_WAKEUP_MODE_EXECUTOR", "")
 BG_WAKEUP_MODE_REFLECTOR: str = _env("BG_WAKEUP_MODE_REFLECTOR", "")
 BG_WAKEUP_MODE_EXPLORATORY: str = _env("BG_WAKEUP_MODE_EXPLORATORY", "")
-
+BG_WAKEUP_MODE_ASSESSOR: str = _env("BG_WAKEUP_MODE_ASSESSOR", "")     # NEW
 
 BG_PROMPT_PLANNER: str = _load_bg_prompt("planner")
 BG_PROMPT_EXECUTOR: str = _load_bg_prompt("executor")

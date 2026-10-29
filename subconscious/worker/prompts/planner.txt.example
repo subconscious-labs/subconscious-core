@@ -20,7 +20,19 @@ Rules:
               * you can point to a specific observation via "based_on".
             The goal should FOLLOW UP on something you already observed.
             Never invent work out of thin air.
-- "skip"  - nothing worth doing this tick.
+- "skip"  - use only when NO open goals exist, OR when every open goal
+            is genuinely not worth touching right now. If you skip while
+            open goals exist, the tick ends without doing anything at all
+            - no exploratory step either. So your skip must be justified.
+
+            Valid reasons to skip with open goals:
+              - "goal already failed twice with the same error"
+              - "goal requires a tool that is currently unavailable"
+              - "goal blocked by missing data, and no way to unblock it"
+            Invalid reasons:
+              - "nothing interesting"
+              - "other goals might be more urgent"
+              - "I'm not sure"
 
 Good "new" examples (following up on observations):
 - "HTTP :80 is open globally"  -> "Check what service listens on port 80"
@@ -28,7 +40,7 @@ Good "new" examples (following up on observations):
 - "wing 'user_family' has only 1 drawer" -> "Investigate why user_family wing is nearly empty"
 
 Bad "new" examples (do NOT do this):
-- "Check that ai00 is running" (vague, no basis in observations)
+- "Check that host-a is running" (vague, no basis in observations)
 - "Verify backups work" (already covered by borgmatic observation)
 - "Monitor disk space" (not based on any observation)
 
@@ -37,13 +49,72 @@ The background worker has only read-only tools. It cannot fix, restrict,
 close, disable, or change anything. If you want to follow up on a security
 observation, propose an investigation, not an action.
 
-  BAD:  "Restrict SSH access on nfs00"
-  GOOD: "Enumerate which hosts can SSH into nfs00 today"
+  BAD:  "Restrict SSH access on storage-host"
+  GOOD: "Enumerate which hosts can SSH into storage-host today"
 
-  BAD:  "Close port 80 on ai00"
-  GOOD: "Identify what service listens on port 80 on ai00"
+  BAD:  "Close port 80 on host-a"
+  GOOD: "Identify what service listens on port 80 on host-a"
 
 If your proposed goal starts with a verb like restrict / close / disable /
 fix / patch / change - rewrite it as an investigation.
 
+Before proposing a "new" goal, check the recently created normal goals
+above. If a very similar investigation was already done or is in progress,
+do NOT propose it again. Either "pick" the existing one (if still open)
+or "skip".
+
 If you cannot point to a specific observation, return "skip".
+
+Two goals are "similar" if they target the same subject with the same
+question. Example of a duplicate:
+  "Investigate why host-a has no mesh peers"
+  "Investigate why the local replica on host-a has no mesh peers"
+
+These are the same. Do not propose the second if the first exists.
+
+When in doubt between "pick" and "skip" with open goals, always pick.
+A failed attempt on a real goal produces more information than a
+successful skip.
+
+Observations are shown with their age in hours. An observation older
+than a few hours may describe a state that no longer holds; if the
+newest signal is stale, prefer "skip" or pick a goal that already has
+fresh context. Do not create new goals based on stale observations.
+
+Goals are shown with both attempts (hard failures) and partials
+(progress without completion). A goal with partials >= 2 has already
+been tried twice and failed for the same blocking reason. Prefer "skip"
+over "pick" for such goals unless a FRESH observation specifically
+provides what the previous partial was missing (a tool that is now
+available, a value that was not there before, a different path that
+just opened up). "It might work this time" is not a reason to pick.
+
+
+Do NOT create a new goal from a self-diagnostic observation.
+When an observation describes the agent's own tooling failure - an
+unknown tool name, a method-not-found rpc error, "-32601", "-32602",
+"Session terminated", a typo in a tool_ref - it is an internal bug
+report for the operator, not an infrastructure signal. It is not a
+thing to investigate through further tool calls.
+
+  BAD:  observation "meta_call returned rpc error -32601 Unknown tool:
+        search" -> new goal "investigate 10:23 tool-layer failures"
+  GOOD: skip. The observation already says what went wrong. The fix is
+        to use the correct tool name next time, not to run another
+        investigation.
+
+
+Do NOT create a new goal from an observation that already contains
+its own explanation. If the observation text states what a phenomenon
+is, why it happens, or what it means ("X is a reporting artifact",
+"Y was caused by Z", "W is expected behaviour", "the premise does not
+hold"), it IS the answer - there is nothing left to investigate. A
+goal is only warranted when the observation raises an UNANSWERED
+question.
+
+  BAD:  observation "running:false is a reporting artifact - the live
+        meta_call succeeded and the backend is up" -> new goal
+        "investigate why the running flag is false"
+  GOOD: skip. The observation already resolved the question. If the
+        flag is a bug worth fixing, that is an OPERATOR task, not a
+        new investigation.

@@ -441,6 +441,59 @@ def cancel_stale_exploratory(goals: List[Dict[str, Any]]) -> int:
     return changed
 
 
+def cancel_stale_normal_goals(
+    goals: List[Dict[str, Any]], ttl_hours: float,
+) -> int:
+    """Cancel normal goals that have been pending without update for
+    longer than ttl_hours.
+
+    Prevents the case where the planner never picks a pending goal (it
+    keeps preferring other work, or it skips) and no executor/reflector
+    transition can fire, leaving the goal unreachable by any state path.
+    TTL is measured from updated_at, so any transition - including a
+    planner pick that resets the goal to pending after a partial - resets
+    the clock.
+
+    Only touches status="pending". Active goals are being worked on right
+    now. Blocked/done/cancelled are already in a state the reflector or
+    operator can act on.
+
+    Only touches kind="normal". Exploratory has its own TTL
+    (cancel_stale_exploratory) with different semantics.
+
+    0 or negative ttl_hours disables the check entirely.
+    """
+    if ttl_hours <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+    changed = 0
+    for g in goals:
+        if g.get("kind") != "normal":
+            continue
+        if g.get("status") != "pending":
+            continue
+        ts = g.get("updated_at")
+        if not ts:
+            continue
+        try:
+            updated = datetime.strptime(
+                ts[:19], "%Y-%m-%dT%H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if updated < cutoff:
+            g["status"] = "cancelled"
+            g["updated_at"] = now_iso()
+            g.setdefault("history", []).append({
+                "ts": g["updated_at"],
+                "event": "cancelled",
+                "by": "system",
+                "note": f"stale: pending for >{ttl_hours:g}h without update",
+            })
+            changed += 1
+    return changed
+
+
 # ── recent-history readers (planner + exploratory accounting) ────────────────
 
 def read_recent_observations(
